@@ -1,0 +1,633 @@
+import { useState, useCallback, useRef } from "react";
+import * as XLSX from "xlsx";
+
+// ── Default command sets (editable) ───────────────────────────────────────
+const INITIAL_DEFAULTS = {
+  dot1x: [
+    "authentication port-control auto",
+    "dot1x pae authenticator",
+    "spanning-tree portfast",
+  ],
+  access: [
+    "switchport mode access",
+  ],
+  trunk: [
+    "switchport mode trunk",
+  ],
+  portchannel: [
+    "channel-group {cgNum} mode {cgMode}",
+  ],
+  shutdownTrue: [
+    "shutdown",
+  ],
+  shutdownFalse: [
+    "no shutdown",
+  ],
+};
+
+const DEFAULTS_META = [
+  { key: "dot1x",        label: "Dot1x = True",       hint: "Added to every access port when Dot1x: True" },
+  { key: "access",       label: "Access mode",         hint: "Added to every access port (non-trunk)" },
+  { key: "trunk",        label: "Trunk mode",          hint: "Added to every trunk/uplink port" },
+  { key: "portchannel",  label: "Port-channel member", hint: "Added to physical ports in a port-channel. Use {cgNum} and {cgMode} as placeholders." },
+  { key: "shutdownTrue", label: "Shutdown = True",     hint: "Added when Shutdown: True" },
+  { key: "shutdownFalse",label: "Shutdown = False",    hint: "Added when Shutdown: False" },
+];
+
+// ── CIDR → subnet mask ─────────────────────────────────────────────────────
+function cidrToMask(cidr) {
+  const prefix = parseInt(cidr, 10);
+  if (isNaN(prefix) || prefix < 0 || prefix > 32) return null;
+  const mask = prefix === 0 ? 0 : (0xffffffff << (32 - prefix)) >>> 0;
+  return [24, 16, 8, 0].map(s => (mask >> s) & 0xff).join(".");
+}
+function parseIPCIDR(ipcidr) {
+  const [ip, prefix] = ipcidr.split("/");
+  if (!ip || !prefix) return null;
+  const mask = cidrToMask(prefix);
+  if (!mask) return null;
+  return { ip: ip.trim(), mask };
+}
+
+// ── YAML parser ────────────────────────────────────────────────────────────
+function parseYAML(text) {
+  const lines = text.split("\n");
+  const root = {};
+  let topContext = null;
+  let currentGroup = null;
+
+  for (const raw of lines) {
+    const line = raw.replace(/\r/, "");
+    if (!line.trim() || line.trim().startsWith("#")) continue;
+    const indent = line.search(/\S/);
+    const trimmed = line.trim();
+
+    if (indent === 0) {
+      const m = trimmed.match(/^([^:]+):\s*(.*)$/);
+      if (!m) continue;
+      const key = m[1].trim();
+      const val = m[2].trim().replace(/^["']|["']$/g, "");
+      if (val) {
+        root[key] = val; topContext = null; currentGroup = null;
+      } else {
+        const reserved = ["Devices", "Modules", "Management"];
+        if (reserved.includes(key)) {
+          root[key] = {}; topContext = key; currentGroup = null;
+        } else {
+          root[key] = {}; topContext = null; currentGroup = key;
+        }
+      }
+      continue;
+    }
+
+    if (indent === 2) {
+      const m = trimmed.match(/^([^:]+):\s*(.*)$/);
+      if (!m) continue;
+      const key = m[1].trim();
+      const val = m[2].trim().replace(/^["']|["']$/g, "");
+      if (topContext) root[topContext][key] = val;
+      else if (currentGroup) root[currentGroup][key] = val;
+      continue;
+    }
+  }
+  return root;
+}
+
+// ── Interface shorthand expander ───────────────────────────────────────────
+// Returns tokens: { type:"single", sh } or { type:"range", sh1, sh2, member, p1, p2 }
+function parseInterfaceTokens(ifaceStr) {
+  if (!ifaceStr) return [];
+  const tokens = [];
+  const parts = ifaceStr.split(",").map(s => s.trim()).filter(Boolean);
+  for (const part of parts) {
+    const rangeM = part.match(/^(\d+)\/(\d+)\s*-\s*(\d+)\/(\d+)$/);
+    if (rangeM) {
+      const [, m1, p1, m2, p2] = rangeM.map(Number);
+      if (m1 === m2) {
+        tokens.push({ type: "range", sh1: `${m1}/${p1}`, sh2: `${m1}/${p2}`, member: m1, p1, p2 });
+      } else {
+        // cross-member range: fall back to singles
+        for (let p = p1; p <= p2; p++) tokens.push({ type: "single", sh: `${m1}/${p}` });
+      }
+      continue;
+    }
+    tokens.push({ type: "single", sh: part });
+  }
+  return tokens;
+}
+
+// ── Resolve shorthand → full IOS interface name ────────────────────────────
+function resolveIface(shorthand, memberModelMap, excelMaps) {
+  const sh = shorthand.trim();
+  const uplinkM = sh.match(/^(\d+)\/(\d+)\/(\d+)$/);
+  if (uplinkM) {
+    const [, member, slot, port] = uplinkM.map(Number);
+    const modKey = `${member}/${slot}`;
+    const modIfaces = excelMaps.modules[modKey];
+    if (!modIfaces?.length) return `! UNRESOLVED_MODULE(${sh}) — no module at ${modKey}`;
+    return modIfaces[port - 1] || `! UNRESOLVED_PORT(${sh})`;
+  }
+  const accessM = sh.match(/^(\d+)\/(\d+)$/);
+  if (accessM) {
+    const [, member, port] = accessM.map(Number);
+    const model = memberModelMap[member];
+    if (!model) return `! UNRESOLVED_MEMBER(${sh}) — member ${member} not in Devices`;
+    const ifaces = excelMaps.platforms[model];
+    if (!ifaces?.length) return `! UNRESOLVED_PLATFORM(${sh}) — no Excel tab for "${model}"`;
+    return ifaces[port - 1] || `! UNRESOLVED_PORT(${sh}) — port ${port} > ${model} count (${ifaces.length})`;
+  }
+  return `! UNRESOLVED(${sh})`;
+}
+
+// ── Resolve a range token → "GigabitEthernet1/0/5 - 10" ──────────────────
+function resolveIfaceRange(token, memberModelMap, excelMaps) {
+  const startIface = resolveIface(token.sh1, memberModelMap, excelMaps);
+  if (startIface.startsWith("! ")) return { rangeStr: startIface, error: true };
+  // Replace last number with "p1 - p2"
+  const rangeStr = `${startIface.replace(/\d+$/, "")}${token.p1} - ${token.p2}`;
+  return { rangeStr, error: false };
+}
+
+// ── Apply placeholder substitution ────────────────────────────────────────
+function applyVars(cmd, vars) {
+  return cmd.replace(/\{(\w+)\}/g, (_, k) => vars[k] ?? `{${k}}`);
+}
+
+// ── Config generator ───────────────────────────────────────────────────────
+function generateConfig(yaml, excelMaps, defaults) {
+  const lines = [];
+  const reservedKeys = new Set(["Devices", "Modules", "Management"]);
+  const portChannelsDone = new Set();
+
+  const devices = yaml.Devices || {};
+  const memberModelMap = {};
+  for (const [k, v] of Object.entries(devices)) memberModelMap[parseInt(k, 10)] = v;
+  const memberCount = Object.keys(memberModelMap).length;
+  const isStack = memberCount > 1;
+
+  const mgmt = yaml.Management || {};
+  const mgmtVlan = mgmt.VLAN || null;
+  const mgmtGW = mgmt.DefaultGW || null;
+  const mgmtIPRaw = mgmt.IP || null;
+  const mgmtIP = mgmtIPRaw ? parseIPCIDR(mgmtIPRaw) : null;
+
+  // Header
+  lines.push(`! ================================================`);
+  lines.push(`! Generated by Cisco Config Generator`);
+  if (isStack) {
+    lines.push(`! Stack (${memberCount} members):`);
+    for (const [num, model] of Object.entries(memberModelMap))
+      lines.push(`!   Member ${num}: ${model}`);
+  } else {
+    lines.push(`! Standalone: ${memberModelMap[1] || "Unknown"}`);
+  }
+  if (yaml.Modules && Object.keys(yaml.Modules).length)
+    for (const [slot, model] of Object.entries(yaml.Modules))
+      lines.push(`! Module ${slot}: ${model}`);
+  if (mgmtVlan) lines.push(`! Management VLAN: ${mgmtVlan}${mgmtIPRaw ? `  IP: ${mgmtIPRaw}` : ""}${mgmtGW ? `  GW: ${mgmtGW}` : ""}`);
+  lines.push(`! ================================================`);
+  lines.push(`!`);
+
+  // Default gateway
+  if (mgmtGW) { lines.push(`ip default-gateway ${mgmtGW}`); lines.push(`!`); }
+
+  // Management VLAN interface
+  if (mgmtVlan) {
+    lines.push(`interface Vlan${mgmtVlan}`);
+    lines.push(` description Management`);
+    if (mgmtIP) lines.push(` ip address ${mgmtIP.ip} ${mgmtIP.mask}`);
+    else lines.push(` ! WARNING: No IP defined for management VLAN`);
+    lines.push(` no shutdown`);
+    lines.push(`!`);
+  }
+
+  // Port groups
+  for (const [groupName, grp] of Object.entries(yaml)) {
+    if (reservedKeys.has(groupName) || typeof grp !== "object" || Array.isArray(grp)) continue;
+    if (!grp || !Object.keys(grp).length) continue;
+
+    const tokens = parseInterfaceTokens(grp.Interfaces || "");
+    const isUplinkMod = ["true","yes"].includes((grp.UplinkModule||"").toLowerCase());
+    const isUplink = isUplinkMod || (grp.Mode||"").toLowerCase() === "trunk";
+    const hasPc = ["true","yes"].includes((grp.PortChannel||"").toLowerCase());
+    const cgNum = grp.ChannelGroup || "1";
+    const cgMode = (grp.ChannelMode || "active").toLowerCase();
+    const dot1x = ["true","yes"].includes((grp.Dot1x||"").toLowerCase());
+    const shutdown = ["true","yes"].includes((grp.Shutdown||"").toLowerCase());
+    const desc = grp.Description || groupName;
+    const vlan = grp.VLAN || grp.Vlan || null;
+    const pcVars = { cgNum, cgMode };
+
+    lines.push(`! --- ${groupName} ---`);
+
+    // helper: emit commands inside an interface or interface range block
+    const emitCommands = () => {
+      lines.push(` description ${desc}`);
+      if (isUplink) {
+        for (const cmd of defaults.trunk) lines.push(` ${applyVars(cmd, pcVars)}`);
+      } else {
+        if (vlan) lines.push(` switchport access vlan ${vlan}`);
+        for (const cmd of defaults.access) lines.push(` ${applyVars(cmd, pcVars)}`);
+        if (dot1x)
+          for (const cmd of defaults.dot1x) lines.push(` ${applyVars(cmd, pcVars)}`);
+      }
+      if (hasPc)
+        for (const cmd of defaults.portchannel) lines.push(` ${applyVars(cmd, pcVars)}`);
+      const sdCmds = shutdown ? defaults.shutdownTrue : defaults.shutdownFalse;
+      for (const cmd of sdCmds) lines.push(` ${applyVars(cmd, pcVars)}`);
+      lines.push(`!`);
+    };
+
+    // 1. Physical interfaces — ranges → "interface range", singles → "interface"
+    for (const token of tokens) {
+      if (token.type === "range") {
+        const { rangeStr, error } = resolveIfaceRange(token, memberModelMap, excelMaps);
+        if (error) { lines.push(rangeStr); continue; }
+        lines.push(`interface range ${rangeStr}`);
+        emitCommands();
+      } else {
+        const iface = resolveIface(token.sh, memberModelMap, excelMaps);
+        lines.push(`interface ${iface}`);
+        emitCommands();
+      }
+    }
+
+    // 2. Port-channel after physical
+    if (hasPc && !portChannelsDone.has(cgNum)) {
+      portChannelsDone.add(cgNum);
+      lines.push(`interface Port-channel${cgNum}`);
+      lines.push(` description ${desc}`);
+      if (isUplink) {
+        for (const cmd of defaults.trunk) lines.push(` ${applyVars(cmd, pcVars)}`);
+      } else {
+        if (vlan) lines.push(` switchport access vlan ${vlan}`);
+        for (const cmd of defaults.access) lines.push(` ${applyVars(cmd, pcVars)}`);
+      }
+      const sdCmds = shutdown ? defaults.shutdownTrue : defaults.shutdownFalse;
+      for (const cmd of sdCmds) lines.push(` ${applyVars(cmd, pcVars)}`);
+      lines.push(`!`);
+    }
+  }
+
+  return lines.join("\n");
+}
+
+// ── Parse Excel ────────────────────────────────────────────────────────────
+function parseExcelMaps(wb, devices, modulesYaml) {
+  const platforms = {};
+  for (const model of new Set(Object.values(devices))) {
+    const sheet = wb.Sheets[model];
+    if (!sheet) continue;
+    platforms[model] = XLSX.utils.sheet_to_json(sheet, { header: 1 })
+      .filter(r => r?.[0] && typeof r[0] === "string").map(r => r[0].trim());
+  }
+  const modules = {};
+  if (modulesYaml) {
+    for (const [slotKey, modModel] of Object.entries(modulesYaml)) {
+      const sheet = wb.Sheets[modModel];
+      if (!sheet) continue;
+      modules[slotKey] = XLSX.utils.sheet_to_json(sheet, { header: 1 })
+        .filter(r => r?.[0] && typeof r[0] === "string").map(r => r[0].trim());
+    }
+  }
+  return { platforms, modules };
+}
+
+// ── Sample data ────────────────────────────────────────────────────────────
+const SAMPLE_YAML = `Devices:
+  1: C9300-24P
+  2: C9300-48P
+Modules:
+  1/1: NM-8X
+Management:
+  IP: 192.168.1.10/24
+  VLAN: 10
+  DefaultGW: 192.168.1.1
+
+Vlan10:
+  Interfaces: 1/1, 1/3, 1/5
+  Mode: Access
+  VLAN: 10
+  Dot1x: True
+  Shutdown: False
+  Description: "Workstations"
+
+Vlan20:
+  Interfaces: 1/6 - 1/10, 2/1 - 2/5
+  Mode: Access
+  VLAN: 20
+  Dot1x: False
+  Shutdown: False
+  Description: "Guest WiFi"
+
+Uplink:
+  Interfaces: 1/1/1, 1/1/2
+  UplinkModule: True
+  Mode: Trunk
+  PortChannel: True
+  ChannelGroup: 1
+  ChannelMode: Active
+  Description: "Uplink to Core"
+`;
+
+const SAMPLE_EXCEL_MAPS = {
+  platforms: {
+    "C9300-24P": Array.from({ length: 24 }, (_, i) => `GigabitEthernet1/0/${i + 1}`),
+    "C9300-48P": Array.from({ length: 48 }, (_, i) => `GigabitEthernet2/0/${i + 1}`),
+  },
+  modules: { "1/1": Array.from({ length: 8 }, (_, i) => `TenGigabitEthernet1/1/${i + 1}`) }
+};
+
+// ── Defaults Modal ─────────────────────────────────────────────────────────
+function DefaultsModal({ defaults, onSave, onClose }) {
+  const [local, setLocal] = useState(
+    () => Object.fromEntries(Object.entries(defaults).map(([k, v]) => [k, v.join("\n")]))
+  );
+  const [activeKey, setActiveKey] = useState(DEFAULTS_META[0].key);
+
+  const handleSave = () => {
+    const parsed = Object.fromEntries(
+      Object.entries(local).map(([k, v]) => [k, v.split("\n").map(s => s.trim()).filter(Boolean)])
+    );
+    onSave(parsed);
+    onClose();
+  };
+
+  const activeMeta = DEFAULTS_META.find(m => m.key === activeKey);
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 }}>
+      <div style={{ background: "#1e293b", border: "1px solid #334155", borderRadius: 12, width: 680, maxHeight: "85vh", display: "flex", flexDirection: "column", overflow: "hidden" }}>
+
+        {/* Modal header */}
+        <div style={{ padding: "16px 20px", borderBottom: "1px solid #334155", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div>
+            <div style={{ fontWeight: 700, fontSize: 15 }}>Command Defaults</div>
+            <div style={{ fontSize: 12, color: "#64748b", marginTop: 2 }}>Edit the IOS commands generated for each condition. One command per line.</div>
+          </div>
+          <button onClick={onClose} style={{ background: "none", border: "none", color: "#64748b", fontSize: 20, cursor: "pointer", lineHeight: 1 }}>✕</button>
+        </div>
+
+        <div style={{ display: "flex", flex: 1, overflow: "hidden" }}>
+          {/* Sidebar */}
+          <div style={{ width: 190, borderRight: "1px solid #334155", padding: "10px 0", overflowY: "auto", flexShrink: 0 }}>
+            {DEFAULTS_META.map(m => (
+              <button key={m.key} onClick={() => setActiveKey(m.key)}
+                style={{
+                  display: "block", width: "100%", textAlign: "left",
+                  padding: "9px 16px", border: "none", cursor: "pointer",
+                  background: activeKey === m.key ? "#0f172a" : "none",
+                  color: activeKey === m.key ? "#e2e8f0" : "#94a3b8",
+                  fontSize: 13, fontWeight: activeKey === m.key ? 600 : 400,
+                  borderLeft: activeKey === m.key ? "3px solid #3b82f6" : "3px solid transparent",
+                }}>
+                {m.label}
+              </button>
+            ))}
+          </div>
+
+          {/* Editor */}
+          <div style={{ flex: 1, padding: 20, display: "flex", flexDirection: "column", gap: 10, overflow: "auto" }}>
+            <div>
+              <div style={{ fontWeight: 600, fontSize: 14, color: "#e2e8f0", marginBottom: 4 }}>{activeMeta.label}</div>
+              <div style={{ fontSize: 12, color: "#64748b" }}>{activeMeta.hint}</div>
+            </div>
+            <textarea
+              value={local[activeKey]}
+              onChange={e => setLocal(prev => ({ ...prev, [activeKey]: e.target.value }))}
+              spellCheck={false}
+              style={{
+                fontFamily: "'Cascadia Code','Fira Mono',monospace",
+                fontSize: 13, lineHeight: 1.7,
+                background: "#0d1117", color: "#a3e635",
+                border: "1px solid #334155", borderRadius: 8,
+                padding: 14, flex: 1, minHeight: 180,
+                resize: "vertical", outline: "none", width: "100%", boxSizing: "border-box",
+              }}
+            />
+            <button
+              onClick={() => setLocal(prev => ({ ...prev, [activeKey]: INITIAL_DEFAULTS[activeKey].join("\n") }))}
+              style={{ alignSelf: "flex-start", padding: "5px 12px", borderRadius: 6, background: "none", border: "1px solid #475569", color: "#64748b", cursor: "pointer", fontSize: 12 }}>
+              ↺ Reset this section
+            </button>
+          </div>
+        </div>
+
+        {/* Footer */}
+        <div style={{ padding: "14px 20px", borderTop: "1px solid #334155", display: "flex", justifyContent: "flex-end", gap: 10 }}>
+          <button onClick={onClose}
+            style={{ padding: "8px 18px", borderRadius: 7, background: "none", border: "1px solid #475569", color: "#94a3b8", cursor: "pointer", fontSize: 13 }}>
+            Cancel
+          </button>
+          <button onClick={handleSave}
+            style={{ padding: "8px 18px", borderRadius: 7, background: "#3b82f6", border: "none", color: "#fff", fontWeight: 700, cursor: "pointer", fontSize: 13 }}>
+            Save & Close
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── App ────────────────────────────────────────────────────────────────────
+export default function App() {
+  const [yamlText, setYamlText]     = useState(SAMPLE_YAML);
+  const [workbook, setWorkbook]     = useState(null);
+  const [excelName, setExcelName]   = useState("");
+  const [config, setConfig]         = useState("");
+  const [error, setError]           = useState("");
+  const [dragging, setDragging]     = useState(false);
+  const [defaults, setDefaults]     = useState(INITIAL_DEFAULTS);
+  const [showDefaults, setShowDefaults] = useState(false);
+  const [showRef, setShowRef] = useState(false);
+  const yamlFileRef = useRef(null);
+
+  const handleExcel = async file => {
+    const buf = await file.arrayBuffer();
+    const wb = XLSX.read(new Uint8Array(buf), { type: "array" });
+    setWorkbook(wb); setExcelName(file.name); setError("");
+  };
+
+  const handleYamlImport = e => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = ev => { setYamlText(ev.target.result); setError(""); };
+    reader.readAsText(file);
+    e.target.value = "";
+  };
+
+  const handleGenerate = () => {
+    try {
+      setError("");
+      const yaml = parseYAML(yamlText);
+      if (!yaml.Devices || !Object.keys(yaml.Devices).length)
+        throw new Error(`YAML must have a "Devices" section.`);
+      const mgmt = yaml.Management || {};
+      if (mgmt.IP && !parseIPCIDR(mgmt.IP))
+        throw new Error(`Invalid Management IP: "${mgmt.IP}" — use CIDR format, e.g. 192.168.1.10/24`);
+      let excelMaps;
+      if (workbook) {
+        excelMaps = parseExcelMaps(workbook, yaml.Devices, yaml.Modules);
+        const missing = [...new Set(Object.values(yaml.Devices))].filter(m => !excelMaps.platforms[m]);
+        if (missing.length)
+          throw new Error(`No Excel tab for: ${missing.join(", ")}. Available: ${workbook.SheetNames.join(", ")}`);
+      } else {
+        excelMaps = SAMPLE_EXCEL_MAPS;
+      }
+      setConfig(generateConfig(yaml, excelMaps, defaults));
+    } catch (e) { setError(e.message); setConfig(""); }
+  };
+
+  const handleDownload = () => {
+    const blob = new Blob([config], { type: "text/plain" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob); a.download = "switch-config.cfg"; a.click();
+  };
+
+  const onDrop = useCallback(e => {
+    e.preventDefault(); setDragging(false);
+    const f = e.dataTransfer.files[0];
+    if (f) handleExcel(f);
+  }, []);
+
+  const mono = {
+    fontFamily: "'Cascadia Code','Fira Mono',monospace",
+    fontSize: 12.5, lineHeight: 1.7,
+    background: "#0d1117", color: "#a3e635",
+    border: "1px solid #334155", borderRadius: 8,
+    padding: 16, width: "100%", boxSizing: "border-box",
+    resize: "vertical", outline: "none",
+  };
+
+  const btnSecondary = {
+    padding: "8px 14px", borderRadius: 7, cursor: "pointer", fontSize: 13,
+    background: "#1e293b", border: "1px solid #334155", color: "#94a3b8",
+    display: "flex", alignItems: "center", gap: 6,
+  };
+
+  return (
+    <div style={{ fontFamily: "system-ui, sans-serif", background: "#0f172a", height: "100vh", overflow: "hidden", color: "#e2e8f0" }}>
+      {showDefaults && (
+        <DefaultsModal defaults={defaults} onSave={setDefaults} onClose={() => setShowDefaults(false)} />
+      )}
+
+      {/* Header */}
+      <div style={{ background: "#1e293b", borderBottom: "1px solid #334155", padding: "13px 24px", display: "flex", alignItems: "center", gap: 12 }}>
+        <div style={{ background: "#3b82f6", borderRadius: 8, width: 34, height: 34, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 17 }}>⚙</div>
+        <div style={{ flex: 1 }}>
+          <div style={{ fontWeight: 700, fontSize: 16 }}>Cisco IOS Config Generator</div>
+          <div style={{ fontSize: 12, color: "#64748b" }}>YAML + Excel platform library → IOS .cfg</div>
+        </div>
+        <button onClick={() => setShowDefaults(true)} style={{ ...btnSecondary, borderColor: "#475569", color: "#cbd5e1" }}>
+          ⚙ Edit Defaults
+        </button>
+      </div>
+
+      <div style={{ padding: "24px 40px", width: "100%", boxSizing: "border-box", margin: "0 auto", display: "grid", gridTemplateColumns: "1fr 1fr", gap: 28, height: "calc(100vh - 62px)" }}>
+
+        {/* LEFT */}
+        <div style={{ display: "flex", flexDirection: "column", height: "100%", gap: 0, overflow: "hidden" }}>
+
+          {/* Scrollable top section: Excel + quick ref */}
+          <div style={{ overflowY: "auto", flexShrink: 0, display: "flex", flexDirection: "column", gap: 16, paddingBottom: 4 }}>
+
+          {/* Excel upload */}
+          <div>
+            <div style={{ fontSize: 13, fontWeight: 600, color: "#94a3b8", marginBottom: 8 }}>
+              1. Platform Excel <span style={{ color: "#475569", fontWeight: 400 }}>(optional — sample data if omitted)</span>
+            </div>
+            <div
+              onDragOver={e => { e.preventDefault(); setDragging(true); }}
+              onDragLeave={() => setDragging(false)}
+              onDrop={onDrop}
+              onClick={() => document.getElementById("xlFile").click()}
+              style={{ border: `2px dashed ${dragging ? "#3b82f6" : "#334155"}`, borderRadius: 8, padding: 14, textAlign: "center", background: dragging ? "#1e3a5f" : "#1e293b", cursor: "pointer", transition: "all .2s" }}>
+              {excelName
+                ? <span style={{ color: "#3b82f6", fontWeight: 600 }}>📊 {excelName}</span>
+                : <span style={{ color: "#475569", fontSize: 13 }}>Drop .xlsx here or click to browse</span>}
+              <input id="xlFile" type="file" accept=".xlsx,.xls" style={{ display: "none" }}
+                onChange={e => e.target.files[0] && handleExcel(e.target.files[0])} />
+            </div>
+            {workbook && <div style={{ marginTop: 6, fontSize: 11, color: "#64748b" }}>Tabs found: {workbook.SheetNames.join(", ")}</div>}
+          </div>
+
+          {/* Quick reference */}
+          <div style={{ background: "#1e293b", border: "1px solid #334155", borderRadius: 8, fontSize: 12, flexShrink: 0 }}>
+            <div onClick={() => setShowRef(v => !v)}
+              style={{ padding: "10px 14px", display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer", userSelect: "none" }}>
+              <span style={{ fontWeight: 600, color: "#94a3b8" }}>YAML quick reference</span>
+              <span style={{ color: "#475569", fontSize: 11 }}>{showRef ? "▲ collapse" : "▼ expand"}</span>
+            </div>
+            {showRef && (
+              <div style={{ padding: "0 14px 12px" }}>
+                <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                  <tbody>
+                    {[
+                      ["Devices", "1 entry = standalone · 2+ = stack (auto)"],
+                      ["Modules", "member/slot: Model  e.g.  1/1: NM-8X"],
+                      ["Management", "IP (CIDR), VLAN, DefaultGW — all optional"],
+                      ["1/5", "Member 1, port 5"],
+                      ["2/1 - 2/8", "Range: member 2, ports 1–8"],
+                      ["1/1/2", "Uplink module: member 1, slot 1, port 2"],
+                      ["UplinkModule: True", "Resolves via module tab, not platform tab"],
+                      ["PortChannel: True", "Physical interfaces first, then Port-channel"],
+                    ].map(([k, v]) => (
+                      <tr key={k} style={{ borderBottom: "1px solid #1e3a5f" }}>
+                        <td style={{ padding: "4px 10px 4px 0", whiteSpace: "nowrap" }}><code style={{ color: "#e2e8f0" }}>{k}</code></td>
+                        <td style={{ padding: "4px 0", color: "#64748b" }}>{v}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+
+          </div>{/* end scrollable */}
+
+          {/* YAML editor — fills all remaining space above button */}
+          <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 0, minHeight: 0, paddingTop: 16 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8, flexShrink: 0 }}>
+              <div style={{ fontSize: 13, fontWeight: 600, color: "#94a3b8" }}>2. Switch YAML</div>
+              <button onClick={() => yamlFileRef.current?.click()} style={{ ...btnSecondary, fontSize: 12, padding: "5px 12px" }}>
+                📂 Import .yaml
+              </button>
+              <input ref={yamlFileRef} type="file" accept=".yaml,.yml,.txt" style={{ display: "none" }} onChange={handleYamlImport} />
+            </div>
+            <textarea value={yamlText} onChange={e => setYamlText(e.target.value)}
+              style={{ ...mono, flex: 1, minHeight: 0, resize: "none" }} spellCheck={false} />
+          </div>
+
+          {/* Pinned bottom: button + error */}
+          <div style={{ display: "flex", flexDirection: "column", gap: 10, paddingTop: 12, borderTop: "1px solid #1e293b" }}>
+          <button onClick={handleGenerate}
+            style={{ padding: 11, borderRadius: 8, background: "#3b82f6", border: "none", color: "#fff", fontWeight: 700, cursor: "pointer", fontSize: 14 }}>
+            ▶ Generate Config
+          </button>
+
+          {error && (
+            <div style={{ background: "#450a0a", border: "1px solid #b91c1c", borderRadius: 8, padding: 12, color: "#fca5a5", fontSize: 13 }}>⚠ {error}</div>
+          )}
+          </div>
+        </div>
+
+        {/* RIGHT */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 12, height: "100%", overflow: "hidden" }}>
+          <div style={{ fontSize: 13, fontWeight: 600, color: "#94a3b8", display: "flex", justifyContent: "space-between", alignItems: "center", flexShrink: 0 }}>
+            <span>3. Generated IOS Config</span>
+            {config && (
+              <button onClick={handleDownload}
+                style={{ padding: "6px 14px", borderRadius: 6, background: "#1e293b", border: "1px solid #3b82f6", color: "#3b82f6", fontWeight: 600, cursor: "pointer", fontSize: 12 }}>
+                ↓ Download .cfg
+              </button>
+            )}
+          </div>
+          <pre style={{ ...mono, flex: 1, minHeight: 0, overflowY: "auto", whiteSpace: "pre-wrap", wordBreak: "break-word", color: config ? "#a3e635" : "#334155" }}>
+            {config || "// Output will appear here after clicking Generate Config"}
+          </pre>
+        </div>
+      </div>
+    </div>
+  );
+}
