@@ -1,6 +1,6 @@
 import { useState, useMemo } from "react";
 import { SWITCH_MODELS, switchPorts, modulePorts, modulesFor, switchSummary, moduleSummary } from "./ref/hardware";
-import { RULESET_OPTIONS, rulesetSummary } from "./ref/rulesets";
+import { RULESET_OPTIONS, rulesetSummary, rulesetUplinks, rulesetPortDefaults, rulesetNaming, formatDescription } from "./ref/rulesets";
 
 // Colors cycled per port group so the grid reads at a glance.
 const GROUP_COLORS = ["#3b82f6","#a3e635","#f97316","#a78bfa","#ec4899","#14b8a6","#facc15","#f87171"];
@@ -9,11 +9,31 @@ const MAX_MEMBERS = 8;   // Catalyst stack limit
 
 const uid = () => Date.now() + Math.random();
 const newMember = () => ({ id: uid(), model: SWITCH_MODELS[0], module: "" });
-const newGroup  = n  => ({
+const newGroup  = (n, defaults = {}) => ({
   id: uid(), name: `Group${n}`, mode: "Access", vlan: "",
-  dot1x: false, shutdown: false, description: "", portChannel: false,
+  dot1x: Boolean(defaults.dot1x), shutdown: Boolean(defaults.shutdown),
+  description: "", portChannel: false,
   channelGroup: "1", channelMode: "Active", ports: [],
 });
+
+// ── Uplink selection ───────────────────────────────────────────────────────
+// Which ports a ruleset's uplink policy would choose. "First port" means the
+// lowest-numbered one, which is the order allPorts is already built in:
+// module ports when the member has a network module, else onboard ports.
+function pickUplinks(allPorts, member, prefer, count) {
+  const onModule = allPorts.filter(p => p.member === member && p.isModule);
+  const onboard  = allPorts.filter(p => p.member === member && !p.isModule);
+  const pool = prefer === "module" && onModule.length ? onModule : onboard;
+  return pool.slice(0, count);
+}
+
+// A standalone switch takes all its uplinks from the one member; a stack takes
+// perMember from each, in member order — that order is the port-channel's.
+function uplinkPorts(members, allPorts, policy) {
+  if (!policy) return [];
+  if (members.length === 1) return pickUplinks(allPorts, 1, policy.prefer, policy.standaloneCount ?? 2);
+  return members.flatMap((_, i) => pickUplinks(allPorts, i + 1, policy.prefer, policy.perMember ?? 1));
+}
 
 // ── Shorthand + range compression ──────────────────────────────────────────
 const shorthand = p => (p.isModule ? `${p.member}/${MODULE_SLOT}/${p.port}` : `${p.member}/${p.port}`);
@@ -105,7 +125,7 @@ const ghostBtn = { padding: "6px 12px", borderRadius: 7, cursor: "pointer", font
 export default function Wizard({ onApply, rulesetId, onRulesetChange }) {
   const [members, setMembers]   = useState(() => [newMember()]);
   const [mgmt, setMgmt]         = useState({ ip: "", vlan: "", gw: "" });
-  const [groups, setGroups]     = useState(() => [newGroup(1)]);
+  const [groups, setGroups]     = useState(() => [newGroup(1, rulesetPortDefaults(rulesetId))]);
   const [activeId, setActiveId] = useState(null);
   const [lastPort, setLastPort] = useState(null);
 
@@ -139,6 +159,32 @@ export default function Wizard({ onApply, rulesetId, onRulesetChange }) {
 
   const patchMember = (id, fields) => setMembers(prev => prev.map(m => (m.id === id ? { ...m, ...fields } : m)));
   const patch       = (id, fields) => setGroups(prev => prev.map(g => (g.id === id ? { ...g, ...fields } : g)));
+
+  const uplinkPolicy = rulesetUplinks(rulesetId);
+  const naming = rulesetNaming(rulesetId);
+  const proposedUplinks = useMemo(
+    () => uplinkPorts(members, allPorts, uplinkPolicy),
+    [members, allPorts, uplinkPolicy]
+  );
+
+  // Materializes the ruleset's uplink policy as a real group, so the YAML still
+  // names every port explicitly instead of depending on the policy later.
+  const addUplinkGroup = () => {
+    const ids = proposedUplinks.map(p => p.id);
+    if (!ids.length) return;
+    const taken = new Set(cleanGroups.map(g => g.name.trim()));
+    let name = "Uplink";
+    for (let i = 2; taken.has(name); i++) name = `Uplink${i}`;
+    const g = {
+      ...newGroup(groups.length + 1),
+      name, mode: "Trunk", dot1x: false, description: "Uplink", ports: ids,
+      portChannel: true,
+      channelGroup: String(uplinkPolicy.channelGroup ?? 1),
+      channelMode: uplinkPolicy.channelMode || "Active",
+    };
+    setGroups(prev => [...prev.map(x => ({ ...x, ports: x.ports.filter(id => !ids.includes(id)) })), g]);
+    setActiveId(g.id);
+  };
 
   // Click assigns to the active group (or unassigns); shift-click fills a range.
   const togglePorts = (ids, forceAdd) => {
@@ -306,11 +352,24 @@ export default function Wizard({ onApply, rulesetId, onRulesetChange }) {
               </button>
             );
           })}
-          <button onClick={() => { const g = newGroup(groups.length + 1); setGroups([...groups, g]); setActiveId(g.id); }}
+          <button onClick={() => { const g = newGroup(groups.length + 1, rulesetPortDefaults(rulesetId)); setGroups([...groups, g]); setActiveId(g.id); }}
             style={ghostBtn}>
             + Add group
           </button>
+          {uplinkPolicy && proposedUplinks.length > 0 && (
+            <button onClick={addUplinkGroup} style={{ ...ghostBtn, borderStyle: "solid", borderColor: "#3b82f6", color: "#3b82f6" }}
+              title={proposedUplinks.map(p => p.name).join("\n")}>
+              ↑ Add uplinks ({proposedUplinks.length} port{proposedUplinks.length > 1 ? "s" : ""}, {uplinkPolicy.channelMode?.toLowerCase()} port-channel)
+            </button>
+          )}
         </div>
+        {uplinkPolicy && proposedUplinks.length > 0 && (
+          <div style={{ fontSize: 11, color: "#64748b", marginTop: -6, marginBottom: 12 }}>
+            {isStack ? `${uplinkPolicy.perMember ?? 1} per member` : `${uplinkPolicy.standaloneCount ?? 2} on a standalone switch`}
+            , preferring the {uplinkPolicy.prefer === "module" ? "network module" : "onboard ports"} →{" "}
+            <span style={{ color: "#94a3b8" }}>{proposedUplinks.map(p => p.name).join(", ")}</span>
+          </div>
+        )}
 
         {/* Port grid — one block per stack member */}
         <div style={{ background: "#0d1117", border: "1px solid #334155", borderRadius: 8, padding: 12, marginBottom: 14 }}>
@@ -363,6 +422,13 @@ export default function Wizard({ onApply, rulesetId, onRulesetChange }) {
               <label style={label}>Description</label>
               <input style={input} placeholder={active.name} value={active.description}
                 onChange={e => patch(active.id, { description: e.target.value })} />
+              {(naming.prefix || naming.noDot1xSuffix) && (
+                <div style={{ fontSize: 11, color: "#64748b", marginTop: 5 }}>
+                  Emitted as <span style={{ color: "#a3e635", fontFamily: "monospace" }}>
+                    description {formatDescription(active.description || active.name, active, naming)}
+                  </span>
+                </div>
+              )}
             </div>
             <div style={{ display: "flex", flexWrap: "wrap", gap: 18, alignItems: "center", fontSize: 13, color: "#cbd5e1" }}>
               {[["dot1x", "Dot1x"], ["shutdown", "Shutdown"], ["portChannel", "Port-channel"]].map(([k, lbl]) => (

@@ -25,3 +25,25 @@ export const FACT_VALUES = {
 };
 
 export const BOOLEAN_FACTS = ["dot1x", "shutdown", "portChannel", "uplinkModule", "hasVlan"];
+
+export const CHANNEL_MODE_VALUES = ["Active", "Passive", "On", "Auto", "Desirable"];
+
+// ── Ruleset sections beyond commands/rules ─────────────────────────────────
+// Condition rules answer "given an interface, which commands?". These three
+// sections cover the things that question cannot reach: what the wizard should
+// pre-fill, how a description is written, and which ports become uplinks.
+
+// naming: how a group's Description becomes the emitted `description` line.
+export const NAMING_KEYS = ["prefix", "noDot1xSuffix"];
+
+// portDefaults: initial state of a newly added port group in the wizard.
+export const PORT_DEFAULT_KEYS = ["dot1x", "shutdown"];
+
+// uplinks: how the wizard picks uplink ports and bundles them.
+export const UPLINK_KEYS = [
+  "standaloneCount",  // uplinks on a single, unstacked switch
+  "perMember",        // uplinks per member once it is a stack
+  "prefer",           // take them from the network module, or from onboard ports
+  "channelGroup", "channelMode",
+];
+export const UPLINK_PREFER = ["module", "onboard"];

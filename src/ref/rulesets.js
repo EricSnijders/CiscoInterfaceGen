@@ -78,6 +78,25 @@ export function matchesRule(when, facts) {
                         : factEquals(want, facts[fact]));
 }
 
+// ── Sections the condition rules cannot express ────────────────────────────
+export const rulesetNaming       = id => RS.rulesets[id]?.naming || {};
+export const rulesetPortDefaults = id => RS.rulesets[id]?.portDefaults || {};
+export const rulesetUplinks      = id => RS.rulesets[id]?.uplinks || null;
+
+// A group's Description as it should appear on the interface. The prefix and
+// suffix are idempotent, so a description typed as ";PRINTER" is not turned
+// into ";;PRINTER".
+export function formatDescription(desc, { mode, dot1x }, naming = {}) {
+  const { prefix = "", noDot1xSuffix = "" } = naming;
+  let out = String(desc ?? "");
+  if (prefix && !out.startsWith(prefix)) out = prefix + out;
+  // ZB marks an access port deliberately left without 802.1X. A trunk was
+  // never a candidate for dot1x, so it is not marked.
+  const unsecured = String(mode).toLowerCase() === "access" && !dot1x;
+  if (noDot1xSuffix && unsecured && !out.endsWith(noDot1xSuffix)) out = `${out} ${noDot1xSuffix}`;
+  return out;
+}
+
 // Serializes edited commands back into Rulesets.json shape, so an in-session
 // tweak can be pasted into the repo file and reviewed as a diff.
 export function toRulesetJSON(id, commands) {

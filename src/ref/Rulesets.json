@@ -31,6 +31,31 @@
         "shutdownFalse": ["no shutdown"]
       }
     },
+    "access-switch": {
+      "name": "Access Switch",
+      "description": "802.1X on by default, ';' description prefix with ZB on unsecured ports, and uplinks bundled into a desirable port-channel.",
+      "portDefaults": { "dot1x": true },
+      "naming": { "prefix": ";", "noDot1xSuffix": "ZB" },
+      "uplinks": {
+        "standaloneCount": 2,
+        "perMember": 1,
+        "prefer": "module",
+        "channelGroup": 1,
+        "channelMode": "Desirable"
+      },
+      "commands": {
+        "dot1x": [
+          "authentication port-control auto",
+          "dot1x pae authenticator",
+          "spanning-tree portfast"
+        ],
+        "access": ["switchport mode access"],
+        "trunk": ["switchport mode trunk"],
+        "portchannel": ["channel-group {cgNum} mode {cgMode}"],
+        "shutdownTrue": ["shutdown"],
+        "shutdownFalse": ["no shutdown"]
+      }
+    },
     "campus-strict": {
       "name": "Campus Strict",
       "description": "Campus Access, but 802.1X only on copper and storm control on copper access ports. Shows what condition rules can express.",

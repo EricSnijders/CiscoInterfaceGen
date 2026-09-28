@@ -2,11 +2,12 @@ import { useState, useRef, useEffect } from "react";
 import Editor, { useMonaco } from "@monaco-editor/react";
 import Wizard from "./Wizard";
 import { buildHardwareMaps } from "./ref/hardware";
+import { CHANNEL_MODE_VALUES } from "./ref/schema";
 import { load as yamlLoad } from "js-yaml";
 import {
   RULESET_IDS, RULESET_OPTIONS, DEFAULT_RULESET_ID, isKnownRuleset,
   rulesetCommands, rulesetName, rulesetSummary, rulesetRuleCount,
-  rulesetRules, matchesRule, toRulesetJSON,
+  rulesetRules, matchesRule, toRulesetJSON, rulesetNaming, formatDescription,
 } from "./ref/rulesets";
 
 // ── Default command sets ───────────────────────────────────────────────────
@@ -25,7 +26,6 @@ const TOP_LEVEL_RESERVED = ["Devices", "Modules", "Management", "Ruleset"];
 const PORT_GROUP_KEYS = ["Interfaces","Mode","VLAN","Dot1x","Shutdown","Description","UplinkModule","PortChannel","ChannelGroup","ChannelMode"];
 const BOOL_KEYS = new Set(["Dot1x","Shutdown","UplinkModule","PortChannel"]);
 const MODE_VALUES = ["Access","Trunk"];
-const CHANNEL_MODE_VALUES = ["Active","Passive","On","Auto","Desirable"];
 const MGMT_KEYS = ["IP","VLAN","DefaultGW"];
 
 // ── YAML validator → returns Monaco markers ────────────────────────────────
@@ -296,7 +296,7 @@ function applyVars(cmd, vars) {
 }
 
 // ── Config generator ───────────────────────────────────────────────────────
-function generateConfig(yaml, excelMaps, rules, rulesetLabel) {
+function generateConfig(yaml, excelMaps, { rules, label, naming }) {
   const lines = [];
   const reservedKeys = new Set(TOP_LEVEL_RESERVED);
   const portChannelsDone = new Set();
@@ -322,7 +322,7 @@ function generateConfig(yaml, excelMaps, rules, rulesetLabel) {
   if (yaml.Modules && Object.keys(yaml.Modules).length)
     for (const [slot, model] of Object.entries(yaml.Modules)) lines.push(`! Module ${slot}: ${model}`);
   if (mgmtVlan) lines.push(`! Management VLAN: ${mgmtVlan}${mgmtIPRaw ? `  IP: ${mgmtIPRaw}` : ""}${mgmtGW ? `  GW: ${mgmtGW}` : ""}`);
-  if (rulesetLabel) lines.push(`! Ruleset: ${rulesetLabel}`);
+  if (label) lines.push(`! Ruleset: ${label}`);
   lines.push(`! ================================================`);
   lines.push(`!`);
   if (mgmtGW) { lines.push(`ip default-gateway ${mgmtGW}`); lines.push(`!`); }
@@ -361,7 +361,7 @@ function generateConfig(yaml, excelMaps, rules, rulesetLabel) {
     lines.push(`! --- ${groupName} ---`);
 
     const emitCommands = facts => {
-      lines.push(` description ${desc}`);
+      lines.push(` description ${formatDescription(desc, facts, naming)}`);
       for (const rule of rules) {
         if (!matchesRule(rule.when, facts)) continue;
         const rowVars = { ...vars, portType: facts.portType || "", member: facts.member ?? "", model: facts.model || "" };
@@ -611,7 +611,11 @@ export default function App() {
       if (missing.length) throw new Error(
         `Not in Switch_Hardware.json: ${missing.map(([m, mdl]) => `member ${m} (${mdl})`).join(", ")}`);
 
-      setConfig(generateConfig(yaml, ifaceMaps, rulesetRules(rsId, commands), rulesetName(rsId)));
+      setConfig(generateConfig(yaml, ifaceMaps, {
+        rules: rulesetRules(rsId, commands),
+        label: rulesetName(rsId),
+        naming: rulesetNaming(rsId),
+      }));
     } catch (e) { setError(e.message); setConfig(""); }
   };
 

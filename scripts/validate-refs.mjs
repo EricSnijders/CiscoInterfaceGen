@@ -9,7 +9,10 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { COMMAND_KEYS, RULE_FACTS, FACT_VALUES, BOOLEAN_FACTS } from "../src/ref/schema.js";
+import {
+  COMMAND_KEYS, RULE_FACTS, FACT_VALUES, BOOLEAN_FACTS,
+  NAMING_KEYS, PORT_DEFAULT_KEYS, UPLINK_KEYS, UPLINK_PREFER, CHANNEL_MODE_VALUES,
+} from "../src/ref/schema.js";
 
 const REF = join(dirname(fileURLToPath(import.meta.url)), "..", "src", "ref");
 const problems = [];
@@ -102,6 +105,56 @@ function checkWhen(file, at, when) {
   }
 }
 
+// naming / portDefaults / uplinks — the sections condition rules cannot express.
+function checkSections(file, id, def) {
+  const unknown = (section, obj, allowed) => {
+    for (const k of Object.keys(obj))
+      if (!allowed.includes(k))
+        fail(file, `${id}.${section}: unknown key "${k}". Valid: ${allowed.join(", ")}`);
+  };
+
+  const naming = def.naming;
+  if (naming !== undefined) {
+    if (typeof naming !== "object" || naming === null || Array.isArray(naming))
+      fail(file, `${id}.naming: must be an object`);
+    else {
+      unknown("naming", naming, NAMING_KEYS);
+      for (const k of NAMING_KEYS)
+        if (naming[k] !== undefined && typeof naming[k] !== "string")
+          fail(file, `${id}.naming.${k}: must be a string`);
+    }
+  }
+
+  const pd = def.portDefaults;
+  if (pd !== undefined) {
+    if (typeof pd !== "object" || pd === null || Array.isArray(pd))
+      fail(file, `${id}.portDefaults: must be an object`);
+    else {
+      unknown("portDefaults", pd, PORT_DEFAULT_KEYS);
+      for (const [k, v] of Object.entries(pd))
+        if (PORT_DEFAULT_KEYS.includes(k) && typeof v !== "boolean")
+          fail(file, `${id}.portDefaults.${k}: must be true or false`);
+    }
+  }
+
+  const up = def.uplinks;
+  if (up !== undefined) {
+    if (typeof up !== "object" || up === null || Array.isArray(up))
+      return fail(file, `${id}.uplinks: must be an object`);
+    unknown("uplinks", up, UPLINK_KEYS);
+    for (const k of ["standaloneCount", "perMember"])
+      if (up[k] !== undefined && (!Number.isInteger(up[k]) || up[k] < 1))
+        fail(file, `${id}.uplinks.${k}: must be a whole number of 1 or more`);
+    if (up.prefer !== undefined && !UPLINK_PREFER.includes(up.prefer))
+      fail(file, `${id}.uplinks.prefer: must be one of ${UPLINK_PREFER.join(", ")}`);
+    if (up.channelMode !== undefined &&
+        !CHANNEL_MODE_VALUES.some(m => m.toLowerCase() === String(up.channelMode).toLowerCase()))
+      fail(file, `${id}.uplinks.channelMode: must be one of ${CHANNEL_MODE_VALUES.join(", ")}`);
+    if (up.channelGroup !== undefined && !(Number.isInteger(up.channelGroup) && up.channelGroup >= 1))
+      fail(file, `${id}.uplinks.channelGroup: must be a whole number of 1 or more`);
+  }
+}
+
 function checkRulesets(models) {
   const file = "Rulesets.json";
   const rs = readJSON(file);
@@ -119,6 +172,8 @@ function checkRulesets(models) {
   for (const [id, def] of Object.entries(sets)) {
     if (typeof def?.name !== "string" || !def.name)
       fail(file, `${id}: needs a "name" for the dropdown`);
+
+    checkSections(file, id, def || {});
 
     for (const [bucket, cmds] of Object.entries(def?.commands || {})) {
       if (!COMMAND_KEYS.includes(bucket))
