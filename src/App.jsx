@@ -1,5 +1,4 @@
-import { useState, useCallback, useRef, useEffect } from "react";
-import * as XLSX from "xlsx";
+import { useState, useRef, useEffect } from "react";
 import Editor, { useMonaco } from "@monaco-editor/react";
 import Wizard from "./Wizard";
 import { buildHardwareMaps } from "./ref/hardware";
@@ -271,8 +270,7 @@ function resolveIface(sh, memberModelMap, excelMaps) {
 }
 
 // Stack member and connector type behind a shorthand, so rulesets can match
-// on them. Type is null on the Excel path (a workbook carries no type column)
-// and on Port-channel interfaces, which have no connector.
+// on them. Type is null on Port-channel interfaces, which have no connector.
 function describePort(sh, maps) {
   const uplinkM = sh.trim().match(/^(\d+)\/(\d+)\/(\d+)$/);
   if (uplinkM) {
@@ -402,31 +400,6 @@ function generateConfig(yaml, excelMaps, rules, rulesetLabel) {
   return lines.join("\n");
 }
 
-// ── Parse Excel ────────────────────────────────────────────────────────────
-function parseExcelMaps(wb, devices, modulesYaml) {
-  // Keyed by member to match buildHardwareMaps. A workbook still holds one tab
-  // per model, so members sharing a model read the same tab — the names in it
-  // are literal, exactly as the operator wrote them.
-  const platforms = {};
-  for (const [memberKey, model] of Object.entries(devices || {})) {
-    const member = parseInt(memberKey, 10);
-    const sheet = wb.Sheets[model];
-    if (!Number.isFinite(member) || !sheet) continue;
-    platforms[member] = XLSX.utils.sheet_to_json(sheet, { header: 1 })
-      .filter(r => r?.[0] && typeof r[0] === "string").map(r => r[0].trim());
-  }
-  const modules = {};
-  if (modulesYaml) {
-    for (const [slotKey, modModel] of Object.entries(modulesYaml)) {
-      const sheet = wb.Sheets[modModel];
-      if (!sheet) continue;
-      modules[slotKey] = XLSX.utils.sheet_to_json(sheet, { header: 1 })
-        .filter(r => r?.[0] && typeof r[0] === "string").map(r => r[0].trim());
-    }
-  }
-  return { platforms, modules };
-}
-
 // ── Sample YAML ────────────────────────────────────────────────────────────
 const SAMPLE_YAML = `Devices:
   1: C9300-24P
@@ -537,11 +510,8 @@ function DefaultsModal({ defaults, rulesetId, onSave, onClose }) {
 // ── App ────────────────────────────────────────────────────────────────────
 export default function App() {
   const [yamlText, setYamlText]         = useState(SAMPLE_YAML);
-  const [workbook, setWorkbook]         = useState(null);
-  const [excelName, setExcelName]       = useState("");
   const [config, setConfig]             = useState("");
   const [error, setError]               = useState("");
-  const [dragging, setDragging]         = useState(false);
   const [rulesetId, setRulesetId]       = useState(DEFAULT_RULESET_ID);
   const [defaults, setDefaults]         = useState(() => rulesetCommands(DEFAULT_RULESET_ID));
   const [showDefaults, setShowDefaults] = useState(false);
@@ -603,11 +573,11 @@ export default function App() {
     if (model) monaco.editor.setModelMarkers(model, "cisco-yaml", m);
   }, [yamlText, monaco, editorReady]);
 
-  const handleExcel = async file => {
-    const buf = await file.arrayBuffer();
-    const wb = XLSX.read(new Uint8Array(buf), { type: "array" });
-    setWorkbook(wb); setExcelName(file.name); setError("");
-  };
+  // Monaco sizes itself on mount, which happens while the YAML pane is hidden.
+  // Re-measure whenever it becomes visible, or it renders zero-height.
+  useEffect(() => {
+    if (mode === "yaml") editorRef.current?.layout();
+  }, [mode, editorReady]);
 
   const handleYamlImport = e => {
     const file = e.target.files[0];
@@ -635,20 +605,12 @@ export default function App() {
         throw new Error(`Unknown ruleset "${rsId}". Available: ${RULESET_IDS.join(", ")}`);
       const commands = rsId === rulesetId ? defaults : rulesetCommands(rsId);
 
-      let ifaceMaps;
       const members = Object.entries(yaml.Devices || {});
-      if (workbook) {
-        // An uploaded workbook overrides the built-in hardware library.
-        ifaceMaps = parseExcelMaps(workbook, yaml.Devices, yaml.Modules);
-        const missing = members.filter(([m]) => !ifaceMaps.platforms[parseInt(m, 10)]?.length);
-        if (missing.length) throw new Error(
-          `No Excel tab for: ${missing.map(([m, mdl]) => `member ${m} (${mdl})`).join(", ")}. Available tabs: ${workbook.SheetNames.join(", ")}`);
-      } else {
-        ifaceMaps = buildHardwareMaps(yaml.Devices, yaml.Modules);
-        const missing = members.filter(([m]) => !ifaceMaps.platforms[parseInt(m, 10)]?.length);
-        if (missing.length) throw new Error(
-          `Not in Switch_Hardware.json: ${missing.map(([m, mdl]) => `member ${m} (${mdl})`).join(", ")}`);
-      }
+      const ifaceMaps = buildHardwareMaps(yaml.Devices, yaml.Modules);
+      const missing = members.filter(([m]) => !ifaceMaps.platforms[parseInt(m, 10)]?.length);
+      if (missing.length) throw new Error(
+        `Not in Switch_Hardware.json: ${missing.map(([m, mdl]) => `member ${m} (${mdl})`).join(", ")}`);
+
       setConfig(generateConfig(yaml, ifaceMaps, rulesetRules(rsId, commands), rulesetName(rsId)));
     } catch (e) { setError(e.message); setConfig(""); }
   };
@@ -667,11 +629,6 @@ export default function App() {
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob); a.download = "switch-config.cfg"; a.click();
   };
-
-  const onDrop = useCallback(e => {
-    e.preventDefault(); setDragging(false);
-    const f = e.dataTransfer.files[0]; if (f) handleExcel(f);
-  }, []);
 
   const errorCount   = markers.filter(m => m.severity === 8).length;
   const warningCount = markers.filter(m => m.severity === 4).length;
@@ -710,25 +667,16 @@ export default function App() {
         {/* LEFT */}
         <div style={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }}>
 
-          {mode === "wizard" ? <Wizard onApply={handleWizardApply} rulesetId={rulesetId} onRulesetChange={selectRuleset} /> : <>
+          {/* Both panes stay mounted and are toggled with CSS: unmounting the
+              wizard would throw away every selection on a trip to the YAML view. */}
+          <div style={{ display: mode === "wizard" ? "flex" : "none", flexDirection: "column", height: "100%", minHeight: 0 }}>
+            <Wizard onApply={handleWizardApply} rulesetId={rulesetId} onRulesetChange={selectRuleset} />
+          </div>
 
-          {/* Top scrollable: Excel + quick ref */}
+          <div style={{ display: mode === "yaml" ? "flex" : "none", flexDirection: "column", height: "100%", minHeight: 0 }}>
+
+          {/* Top scrollable: quick ref */}
           <div style={{ flexShrink: 0, display: "flex", flexDirection: "column", gap: 16, paddingBottom: 16 }}>
-
-            {/* Excel upload */}
-            <div>
-              <div style={{ fontSize: 13, fontWeight: 600, color: "#94a3b8", marginBottom: 8 }}>
-                1. Platform Excel <span style={{ color: "#475569", fontWeight: 400 }}>(optional — overrides Switch_Hardware.json)</span>
-              </div>
-              <div onDragOver={e => { e.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={onDrop}
-                onClick={() => document.getElementById("xlFile").click()}
-                style={{ border: `2px dashed ${dragging ? "#3b82f6" : "#334155"}`, borderRadius: 8, padding: 14, textAlign: "center", background: dragging ? "#1e3a5f" : "#1e293b", cursor: "pointer", transition: "all .2s" }}>
-                {excelName ? <span style={{ color: "#3b82f6", fontWeight: 600 }}>📊 {excelName}</span>
-                  : <span style={{ color: "#475569", fontSize: 13 }}>Drop .xlsx here or click to browse</span>}
-                <input id="xlFile" type="file" accept=".xlsx,.xls" style={{ display: "none" }} onChange={e => e.target.files[0] && handleExcel(e.target.files[0])} />
-              </div>
-              {workbook && <div style={{ marginTop: 6, fontSize: 11, color: "#64748b" }}>Tabs found: {workbook.SheetNames.join(", ")}</div>}
-            </div>
 
             {/* Collapsible quick ref */}
             <div style={{ background: "#1e293b", border: "1px solid #334155", borderRadius: 8, fontSize: 12 }}>
@@ -821,7 +769,7 @@ export default function App() {
             </button>
             {error && <div style={{ marginTop: 8, background: "#450a0a", border: "1px solid #b91c1c", borderRadius: 8, padding: 12, color: "#fca5a5", fontSize: 13 }}>⚠ {error}</div>}
           </div>
-          </>}
+          </div>
         </div>
 
         {/* RIGHT */}

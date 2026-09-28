@@ -1,7 +1,7 @@
 // ── Hardware library ───────────────────────────────────────────────────────
 // Reads Switch_Hardware.json and expands {namePattern, portRange} blocks into
-// concrete interface names. This replaces the per-model Excel tabs: a tab's
-// column A is exactly what expandPorts() produces here.
+// concrete interface names. This is the single source of interface data for
+// the app; it replaced a per-model Excel workbook.
 import HW from "./Switch_Hardware.json";
 
 export const SWITCH_MODELS = Object.keys(HW.switches).sort();
@@ -70,8 +70,7 @@ const toTypeArray = ports => {
 
 // Keyed by MEMBER, not by model: a stack of two identical switches needs
 // member 2 to resolve to "…2/0/x", which a model-keyed map cannot express.
-// The parallel *Types maps let rulesets match on connector type; an uploaded
-// workbook has no type column, so those stay empty on the Excel path.
+// The parallel *Types maps let rulesets match on connector type.
 export function buildHardwareMaps(devices = {}, modules = {}) {
   const platforms = {}, platformTypes = {};
   for (const [memberKey, model] of Object.entries(devices)) {

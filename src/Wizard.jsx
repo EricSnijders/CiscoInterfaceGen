@@ -94,7 +94,10 @@ function buildYAML({ members, ruleset, mgmt, groups, portsById }) {
 // ── Shared styles ──────────────────────────────────────────────────────────
 const card  = { background: "#1e293b", border: "1px solid #334155", borderRadius: 10, padding: 16 };
 const label = { fontSize: 12, fontWeight: 600, color: "#94a3b8", marginBottom: 6, display: "block" };
-const input = { background: "#0d1117", border: "1px solid #334155", borderRadius: 6, color: "#e2e8f0", padding: "7px 10px", fontSize: 13, width: "100%", boxSizing: "border-box", outline: "none" };
+// Fixed height so a <select>, a plain <div> and a <button> sitting in the same
+// grid row line up: their natural heights differ by a pixel or two otherwise.
+const CONTROL_H = 34;
+const input = { background: "#0d1117", border: "1px solid #334155", borderRadius: 6, color: "#e2e8f0", padding: "7px 10px", fontSize: 13, width: "100%", height: CONTROL_H, boxSizing: "border-box", outline: "none" };
 const stepTitle = { fontSize: 13, fontWeight: 700, color: "#e2e8f0", marginBottom: 12, display: "flex", alignItems: "center", gap: 8 };
 const badge = { background: "#3b82f6", color: "#fff", borderRadius: "50%", width: 20, height: 20, display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 700, flexShrink: 0 };
 const ghostBtn = { padding: "6px 12px", borderRadius: 7, cursor: "pointer", fontSize: 12, background: "none", border: "1px dashed #475569", color: "#64748b" };
@@ -209,11 +212,13 @@ export default function Wizard({ onApply, rulesetId, onRulesetChange }) {
           </span>
         </div>
 
+        {/* Top-aligned: every cell leads with a label of the same height, so the
+            controls line up even though only some cells carry a hint below. */}
         {members.map((m, i) => (
-          <div key={m.id} style={{ display: "grid", gridTemplateColumns: "42px 1fr 1fr auto", gap: 10, alignItems: "end", marginBottom: 10 }}>
+          <div key={m.id} style={{ display: "grid", gridTemplateColumns: "42px 1fr 1fr auto", gap: 10, alignItems: "start", marginBottom: 10 }}>
             <div>
               <label style={label}>Mbr</label>
-              <div style={{ ...input, textAlign: "center", fontWeight: 700, color: "#3b82f6" }}>{i + 1}</div>
+              <div style={{ ...input, fontWeight: 700, color: "#3b82f6", display: "flex", alignItems: "center", justifyContent: "center", padding: 0 }}>{i + 1}</div>
             </div>
             <div>
               <label style={label}>Switch model</label>
@@ -232,12 +237,17 @@ export default function Wizard({ onApply, rulesetId, onRulesetChange }) {
                 {m.module ? `${moduleSummary(m.module)} — slot ${i + 1}/${MODULE_SLOT}` : "No uplink module"}
               </div>
             </div>
-            <button onClick={() => setMembers(members.filter(x => x.id !== m.id))} disabled={members.length === 1}
-              title={members.length === 1 ? "A switch needs at least one member" : "Remove this member"}
-              style={{ padding: "7px 11px", borderRadius: 6, background: "none", cursor: members.length === 1 ? "not-allowed" : "pointer",
-                border: `1px solid ${members.length === 1 ? "#334155" : "#7f1d1d"}`, color: members.length === 1 ? "#334155" : "#f87171", fontSize: 12 }}>
-              ✕
-            </button>
+            <div>
+              {/* Keeps this cell's control on the same baseline as the others. */}
+              <label style={{ ...label, visibility: "hidden" }}>&nbsp;</label>
+              <button onClick={() => setMembers(members.filter(x => x.id !== m.id))} disabled={members.length === 1}
+                title={members.length === 1 ? "A switch needs at least one member" : "Remove this member"}
+                style={{ width: CONTROL_H, height: CONTROL_H, boxSizing: "border-box", padding: 0, borderRadius: 6, background: "none",
+                  cursor: members.length === 1 ? "not-allowed" : "pointer", fontSize: 13,
+                  border: `1px solid ${members.length === 1 ? "#334155" : "#7f1d1d"}`, color: members.length === 1 ? "#334155" : "#f87171" }}>
+                ✕
+              </button>
+            </div>
           </div>
         ))}
 
