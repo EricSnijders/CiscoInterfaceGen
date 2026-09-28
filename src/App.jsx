@@ -3,9 +3,11 @@ import * as XLSX from "xlsx";
 import Editor, { useMonaco } from "@monaco-editor/react";
 import Wizard from "./Wizard";
 import { buildHardwareMaps } from "./ref/hardware";
+import { load as yamlLoad } from "js-yaml";
 import {
   RULESET_IDS, RULESET_OPTIONS, DEFAULT_RULESET_ID, isKnownRuleset,
-  rulesetCommands, rulesetName, rulesetSummary, toRulesetJSON,
+  rulesetCommands, rulesetName, rulesetSummary, rulesetRuleCount,
+  rulesetRules, matchesRule, toRulesetJSON,
 } from "./ref/rulesets";
 
 // ── Default command sets ───────────────────────────────────────────────────
@@ -40,6 +42,16 @@ function validateYAML(text) {
     message: msg,
     severity, // 8=Error, 4=Warning, 2=Info
   });
+
+  // Genuine syntax errors (bad indentation, tabs, duplicate keys, unclosed
+  // quotes) come from js-yaml with a line number. Schema checks below would
+  // only pile noise on top of them, so report the syntax error alone.
+  try { yamlLoad(text); }
+  catch (e) {
+    const line = (e.mark?.line ?? 0) + 1;
+    return [{ startLineNumber: line, endLineNumber: line, startColumn: 1, endColumn: 200,
+              message: `YAML syntax: ${e.reason || e.message}`, severity: 8 }];
+  }
 
   let hasDevices = false;
 
@@ -85,7 +97,8 @@ function validateYAML(text) {
       } else if (currentGroup) {
         if (!PORT_GROUP_KEYS.includes(key))
           mark(lineNum, `Unknown key "${key}". Valid port group keys: ${PORT_GROUP_KEYS.join(", ")}`, 4);
-        if (BOOL_KEYS.has(key) && val && !["True","False","true","false"].includes(val))
+        // Match what the generator actually accepts, including YAML's yes/no.
+        if (BOOL_KEYS.has(key) && val && !["true","false","yes","no"].includes(val.toLowerCase()))
           mark(lineNum, `"${key}" must be True or False`);
         if (key === "Mode" && val && !MODE_VALUES.map(v=>v.toLowerCase()).includes(val.toLowerCase()))
           mark(lineNum, `Mode must be Access or Trunk`);
@@ -197,38 +210,23 @@ function parseIPCIDR(ipcidr) {
 }
 
 // ── YAML parser ────────────────────────────────────────────────────────────
+// js-yaml handles the syntax (quoting, comments, tabs, duplicate keys); the
+// line-based validator above owns the schema. It types scalars, so every value
+// is normalized back to the flat string dialect the generator compares against
+// ("True"/"False", "10") rather than booleans and numbers.
+function normalizeScalars(v) {
+  if (v === null || v === undefined) return "";
+  if (Array.isArray(v)) return v.map(normalizeScalars);
+  if (typeof v === "object")
+    return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, normalizeScalars(x)]));
+  if (typeof v === "boolean") return v ? "True" : "False";
+  return String(v);
+}
+
 function parseYAML(text) {
-  const lines = text.split("\n");
-  const root = {};
-  let topContext = null;
-  let currentGroup = null;
-  for (const raw of lines) {
-    const line = raw.replace(/\r/, "");
-    if (!line.trim() || line.trim().startsWith("#")) continue;
-    const indent = line.search(/\S/);
-    const trimmed = line.trim();
-    if (indent === 0) {
-      const m = trimmed.match(/^([^:]+):\s*(.*)$/);
-      if (!m) continue;
-      const key = m[1].trim();
-      const val = m[2].trim().replace(/^["']|["']$/g, "");
-      if (val) { root[key] = val; topContext = null; currentGroup = null; }
-      else {
-        if (TOP_LEVEL_RESERVED.includes(key)) { root[key] = {}; topContext = key; currentGroup = null; }
-        else { root[key] = {}; topContext = null; currentGroup = key; }
-      }
-      continue;
-    }
-    if (indent === 2) {
-      const m = trimmed.match(/^([^:]+):\s*(.*)$/);
-      if (!m) continue;
-      const key = m[1].trim();
-      const val = m[2].trim().replace(/^["']|["']$/g, "");
-      if (topContext) root[topContext][key] = val;
-      else if (currentGroup) root[currentGroup][key] = val;
-    }
-  }
-  return root;
+  const doc = yamlLoad(text);   // throws YAMLException; callers surface it
+  if (!doc || typeof doc !== "object" || Array.isArray(doc)) return {};
+  return normalizeScalars(doc);
 }
 
 // ── Interface token parser ─────────────────────────────────────────────────
@@ -272,6 +270,23 @@ function resolveIface(sh, memberModelMap, excelMaps) {
   return `! UNRESOLVED(${sh})`;
 }
 
+// Stack member and connector type behind a shorthand, so rulesets can match
+// on them. Type is null on the Excel path (a workbook carries no type column)
+// and on Port-channel interfaces, which have no connector.
+function describePort(sh, maps) {
+  const uplinkM = sh.trim().match(/^(\d+)\/(\d+)\/(\d+)$/);
+  if (uplinkM) {
+    const [, member, slot, port] = uplinkM.map(Number);
+    return { member, portType: maps.moduleTypes?.[`${member}/${slot}`]?.[port - 1] || null };
+  }
+  const accessM = sh.trim().match(/^(\d+)\/(\d+)$/);
+  if (accessM) {
+    const [, member, port] = accessM.map(Number);
+    return { member, portType: maps.platformTypes?.[member]?.[port - 1] || null };
+  }
+  return { member: null, portType: null };
+}
+
 function resolveIfaceRange(token, memberModelMap, excelMaps) {
   const startIface = resolveIface(token.sh1, memberModelMap, excelMaps);
   if (startIface.startsWith("! ")) return { rangeStr: startIface, error: true };
@@ -283,7 +298,7 @@ function applyVars(cmd, vars) {
 }
 
 // ── Config generator ───────────────────────────────────────────────────────
-function generateConfig(yaml, excelMaps, defaults, rulesetLabel) {
+function generateConfig(yaml, excelMaps, rules, rulesetLabel) {
   const lines = [];
   const reservedKeys = new Set(TOP_LEVEL_RESERVED);
   const portChannelsDone = new Set();
@@ -335,46 +350,53 @@ function generateConfig(yaml, excelMaps, defaults, rulesetLabel) {
     const shutdown = ["true","yes"].includes((grp.Shutdown||"").toLowerCase());
     const desc = grp.Description || groupName;
     const vlan = grp.VLAN || grp.Vlan || null;
-    const pcVars = { cgNum, cgMode };
+
+    // Facts shared by every interface in the group; member and portType vary
+    // per interface and are merged in per token below.
+    const groupFacts = {
+      mode: isUplink ? "Trunk" : "Access",
+      dot1x, shutdown, portChannel: hasPc, uplinkModule: isUplinkMod,
+      hasVlan: Boolean(vlan),
+    };
+    const vars = { cgNum, cgMode, vlan: vlan || "", description: desc };
+
     lines.push(`! --- ${groupName} ---`);
-    const emitCommands = () => {
+
+    const emitCommands = facts => {
       lines.push(` description ${desc}`);
-      if (isUplink) {
-        for (const cmd of defaults.trunk) lines.push(` ${applyVars(cmd, pcVars)}`);
-      } else {
-        if (vlan) lines.push(` switchport access vlan ${vlan}`);
-        for (const cmd of defaults.access) lines.push(` ${applyVars(cmd, pcVars)}`);
-        if (dot1x) for (const cmd of defaults.dot1x) lines.push(` ${applyVars(cmd, pcVars)}`);
+      for (const rule of rules) {
+        if (!matchesRule(rule.when, facts)) continue;
+        const rowVars = { ...vars, portType: facts.portType || "", member: facts.member ?? "", model: facts.model || "" };
+        for (const cmd of rule.commands) lines.push(` ${applyVars(cmd, rowVars)}`);
       }
-      if (hasPc) for (const cmd of defaults.portchannel) lines.push(` ${applyVars(cmd, pcVars)}`);
-      const sdCmds = shutdown ? defaults.shutdownTrue : defaults.shutdownFalse;
-      for (const cmd of sdCmds) lines.push(` ${applyVars(cmd, pcVars)}`);
       lines.push(`!`);
     };
+
+    // A range is emitted as a single block, so its facts come from its first
+    // port — the wizard never builds a range that spans two connector types.
+    const factsFor = sh => {
+      const { member, portType } = describePort(sh, excelMaps);
+      return { ...groupFacts, interface: "physical", member, portType, model: memberModelMap[member] };
+    };
+
     for (const token of tokens) {
       if (token.type === "range") {
         const { rangeStr, error } = resolveIfaceRange(token, memberModelMap, excelMaps);
         if (error) { lines.push(rangeStr); continue; }
         lines.push(`interface range ${rangeStr}`);
-        emitCommands();
+        emitCommands(factsFor(token.sh1));
       } else {
         lines.push(`interface ${resolveIface(token.sh, memberModelMap, excelMaps)}`);
-        emitCommands();
+        emitCommands(factsFor(token.sh));
       }
     }
+
     if (hasPc && !portChannelsDone.has(cgNum)) {
       portChannelsDone.add(cgNum);
       lines.push(`interface Port-channel${cgNum}`);
-      lines.push(` description ${desc}`);
-      if (isUplink) {
-        for (const cmd of defaults.trunk) lines.push(` ${applyVars(cmd, pcVars)}`);
-      } else {
-        if (vlan) lines.push(` switchport access vlan ${vlan}`);
-        for (const cmd of defaults.access) lines.push(` ${applyVars(cmd, pcVars)}`);
-      }
-      const sdCmds = shutdown ? defaults.shutdownTrue : defaults.shutdownFalse;
-      for (const cmd of sdCmds) lines.push(` ${applyVars(cmd, pcVars)}`);
-      lines.push(`!`);
+      // The logical interface has no connector, so portType stays unset and
+      // type-conditioned rules correctly skip it.
+      emitCommands({ ...groupFacts, interface: "port-channel", member: null, portType: null });
     }
   }
   return lines.join("\n");
@@ -463,6 +485,11 @@ function DefaultsModal({ defaults, rulesetId, onSave, onClose }) {
             <div style={{ fontSize: 12, color: "#64748b", marginTop: 2 }}>
               Edit IOS commands per condition, one per line. Changes apply to this session only.
             </div>
+            {rulesetRuleCount(rulesetId) > 0 && (
+              <div style={{ fontSize: 12, color: "#facc15", marginTop: 5 }}>
+                + {rulesetRuleCount(rulesetId)} condition rule(s) in Rulesets.json — edit the file to change those.
+              </div>
+            )}
           </div>
           <button onClick={onClose} style={{ background: "none", border: "none", color: "#64748b", fontSize: 20, cursor: "pointer" }}>✕</button>
         </div>
@@ -622,7 +649,7 @@ export default function App() {
         if (missing.length) throw new Error(
           `Not in Switch_Hardware.json: ${missing.map(([m, mdl]) => `member ${m} (${mdl})`).join(", ")}`);
       }
-      setConfig(generateConfig(yaml, ifaceMaps, commands, rulesetName(rsId)));
+      setConfig(generateConfig(yaml, ifaceMaps, rulesetRules(rsId, commands), rulesetName(rsId)));
     } catch (e) { setError(e.message); setConfig(""); }
   };
 

@@ -7,10 +7,12 @@
     "dev": "vite",
     "build": "vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "validate": "node scripts/validate-refs.mjs"
   },
   "dependencies": {
     "@monaco-editor/react": "^4.7.0",
+    "js-yaml": "^5.4.2",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
     "xlsx": "^0.18.5"

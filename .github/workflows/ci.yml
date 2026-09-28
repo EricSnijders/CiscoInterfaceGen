@@ -1,0 +1,35 @@
+# Runs on every pull request, and on every push to main.
+# If any step fails, GitHub marks the pull request with a red ✗ and says which
+# step broke — so a bad edit to src/ref never reaches the live site.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      # npm ci installs exactly what package-lock.json pins, so CI and your
+      # machine run identical dependencies.
+      - run: npm ci
+
+      # The reference data: valid JSON, and structurally sound. This is the
+      # check that matters most, since colleagues edit those files by hand.
+      - name: Validate hardware and ruleset files
+        run: npm run validate
+
+      - name: Lint
+        run: npm run lint
+
+      # Catches anything that would break the deployed bundle.
+      - name: Build
+        run: npm run build

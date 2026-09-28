@@ -4,23 +4,26 @@ import { RULESET_OPTIONS, rulesetSummary } from "./ref/rulesets";
 
 // Colors cycled per port group so the grid reads at a glance.
 const GROUP_COLORS = ["#3b82f6","#a3e635","#f97316","#a78bfa","#ec4899","#14b8a6","#facc15","#f87171"];
-const MODULE_SLOT  = "1/1";   // single-switch wizard: one module, member 1 slot 1
-const MEMBER       = 1;
+const MODULE_SLOT = 1;   // one uplink module per member, slot 1
+const MAX_MEMBERS = 8;   // Catalyst stack limit
 
-const newGroup = n => ({
-  id: Date.now() + Math.random(), name: `Group${n}`, mode: "Access", vlan: "",
+const uid = () => Date.now() + Math.random();
+const newMember = () => ({ id: uid(), model: SWITCH_MODELS[0], module: "" });
+const newGroup  = n  => ({
+  id: uid(), name: `Group${n}`, mode: "Access", vlan: "",
   dot1x: false, shutdown: false, description: "", portChannel: false,
   channelGroup: "1", channelMode: "Active", ports: [],
 });
 
 // ── Shorthand + range compression ──────────────────────────────────────────
-// Only merges consecutive ports sharing a namePattern, so a range never spans
-// a speed boundary (e.g. C9300-48UXM TwoGig 1-36 → TenGig 37-48).
-function compress(ports, isModule) {
+const shorthand = p => (p.isModule ? `${p.member}/${MODULE_SLOT}/${p.port}` : `${p.member}/${p.port}`);
+
+// Merges only consecutive ports that share a member AND a namePattern, so a
+// range never spans a stack member or a connector-speed boundary.
+function compressRun(ports) {
   const sorted = [...ports].sort((a, b) => a.port - b.port);
   const out = [];
   let run = [];
-  const shorthand = p => (isModule ? `${MEMBER}/${MODULE_SLOT.split("/")[1]}/${p.port}` : `${MEMBER}/${p.port}`);
   const flush = () => {
     if (!run.length) return;
     if (run.length >= 3) out.push(`${shorthand(run[0])} - ${shorthand(run[run.length - 1])}`);
@@ -33,17 +36,38 @@ function compress(ports, isModule) {
     else { flush(); run = [p]; }
   }
   flush();
-  return out.join(", ");
+  return out;
+}
+
+// Groups a mixed selection by member and onboard/module, then compresses each.
+function interfaceList(ports) {
+  const buckets = new Map();
+  for (const p of ports) {
+    const key = `${p.member}|${p.isModule ? 1 : 0}`;
+    if (!buckets.has(key)) buckets.set(key, []);
+    buckets.get(key).push(p);
+  }
+  const keys = [...buckets.keys()].sort((a, b) => {
+    const [ma, ta] = a.split("|").map(Number);
+    const [mb, tb] = b.split("|").map(Number);
+    return ma - mb || ta - tb;
+  });
+  return keys.flatMap(k => compressRun(buckets.get(k))).join(", ");
 }
 
 // ── YAML emitter — the whole point: indentation is never hand-typed ────────
-function buildYAML({ model, module: mod, ruleset, mgmt, groups, portsById }) {
+function buildYAML({ members, ruleset, mgmt, groups, portsById }) {
   const L = [];
   // Naming the ruleset in the file makes the config reproducible: whoever
   // regenerates it gets the same commands without picking anything.
   if (ruleset) L.push(`Ruleset: ${ruleset}`);
-  L.push(`Devices:`, `  ${MEMBER}: ${model}`);
-  if (mod) L.push(`Modules:`, `  ${MODULE_SLOT}: ${mod}`);
+  L.push(`Devices:`);
+  members.forEach((m, i) => L.push(`  ${i + 1}: ${m.model}`));
+  const withModules = members.map((m, i) => [i + 1, m.module]).filter(([, mod]) => mod);
+  if (withModules.length) {
+    L.push(`Modules:`);
+    withModules.forEach(([n, mod]) => L.push(`  ${n}/${MODULE_SLOT}: ${mod}`));
+  }
   if (mgmt.ip || mgmt.vlan || mgmt.gw) {
     L.push(`Management:`);
     if (mgmt.ip)   L.push(`  IP: ${mgmt.ip}`);
@@ -52,14 +76,12 @@ function buildYAML({ model, module: mod, ruleset, mgmt, groups, portsById }) {
   }
   for (const g of groups) {
     if (!g.ports.length) continue;
-    const swPorts  = g.ports.map(id => portsById[id]).filter(p => p && !p.isModule);
-    const modPorts = g.ports.map(id => portsById[id]).filter(p => p && p.isModule);
-    const ifaces = [compress(swPorts, false), compress(modPorts, true)].filter(Boolean).join(", ");
+    const ports = g.ports.map(id => portsById[id]).filter(Boolean);
     L.push(``, `${g.name}:`);
-    L.push(`  Interfaces: ${ifaces}`);
+    L.push(`  Interfaces: ${interfaceList(ports)}`);
     L.push(`  Mode: ${g.mode}`);
     if (g.mode === "Access" && g.vlan) L.push(`  VLAN: ${g.vlan}`);
-    if (modPorts.length) L.push(`  UplinkModule: True`);
+    if (ports.some(p => p.isModule)) L.push(`  UplinkModule: True`);
     L.push(`  Dot1x: ${g.dot1x ? "True" : "False"}`);
     L.push(`  Shutdown: ${g.shutdown ? "True" : "False"}`);
     if (g.portChannel)
@@ -75,26 +97,34 @@ const label = { fontSize: 12, fontWeight: 600, color: "#94a3b8", marginBottom: 6
 const input = { background: "#0d1117", border: "1px solid #334155", borderRadius: 6, color: "#e2e8f0", padding: "7px 10px", fontSize: 13, width: "100%", boxSizing: "border-box", outline: "none" };
 const stepTitle = { fontSize: 13, fontWeight: 700, color: "#e2e8f0", marginBottom: 12, display: "flex", alignItems: "center", gap: 8 };
 const badge = { background: "#3b82f6", color: "#fff", borderRadius: "50%", width: 20, height: 20, display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 700, flexShrink: 0 };
+const ghostBtn = { padding: "6px 12px", borderRadius: 7, cursor: "pointer", fontSize: 12, background: "none", border: "1px dashed #475569", color: "#64748b" };
 
 export default function Wizard({ onApply, rulesetId, onRulesetChange }) {
-  const [model, setModel]       = useState(SWITCH_MODELS[0]);
-  const [mod, setMod]           = useState("");
+  const [members, setMembers]   = useState(() => [newMember()]);
   const [mgmt, setMgmt]         = useState({ ip: "", vlan: "", gw: "" });
   const [groups, setGroups]     = useState(() => [newGroup(1)]);
   const [activeId, setActiveId] = useState(null);
   const [lastPort, setLastPort] = useState(null);
 
-  const compatible = useMemo(() => modulesFor(model), [model]);
+  const isStack = members.length > 1;
 
-  // Flat port list with stable ids: onboard ports first, then module ports.
+  // Flat, ordered port list across every member: member 1 onboard, member 1
+  // module, member 2 onboard, … Stable ids survive re-renders; they encode
+  // the member so a model change only invalidates that member's ports.
   const { allPorts, portsById } = useMemo(() => {
-    const sp = switchPorts(model, MEMBER).map(p => ({ ...p, isModule: false, id: `s${p.port}` }));
-    const mp = mod ? modulePorts(mod, MEMBER).map(p => ({ ...p, isModule: true, id: `m${p.port}` })) : [];
-    const all = [...sp, ...mp];
+    const all = [];
+    members.forEach((m, i) => {
+      const member = i + 1;
+      for (const p of switchPorts(m.model, member))
+        all.push({ ...p, member, isModule: false, id: `s${member}-${p.port}` });
+      if (m.module)
+        for (const p of modulePorts(m.module, member))
+          all.push({ ...p, member, isModule: true, id: `m${member}-${p.port}` });
+    });
     return { allPorts: all, portsById: Object.fromEntries(all.map(p => [p.id, p])) };
-  }, [model, mod]);
+  }, [members]);
 
-  // Switching model or module drops port ids that no longer exist.
+  // Changing a model or removing a member drops ports that no longer exist.
   const cleanGroups = useMemo(() => {
     const valid = new Set(allPorts.map(p => p.id));
     return groups.map(g => ({ ...g, ports: g.ports.filter(id => valid.has(id)) }));
@@ -103,6 +133,9 @@ export default function Wizard({ onApply, rulesetId, onRulesetChange }) {
   const active  = cleanGroups.find(g => g.id === activeId) || cleanGroups[0];
   const ownerOf = id => cleanGroups.find(g => g.ports.includes(id));
   const colorOf = g => GROUP_COLORS[cleanGroups.findIndex(x => x.id === g.id) % GROUP_COLORS.length];
+
+  const patchMember = (id, fields) => setMembers(prev => prev.map(m => (m.id === id ? { ...m, ...fields } : m)));
+  const patch       = (id, fields) => setGroups(prev => prev.map(g => (g.id === id ? { ...g, ...fields } : g)));
 
   // Click assigns to the active group (or unassigns); shift-click fills a range.
   const togglePorts = (ids, forceAdd) => {
@@ -128,8 +161,6 @@ export default function Wizard({ onApply, rulesetId, onRulesetChange }) {
     setLastPort(p.id);
   };
 
-  const patch = (id, fields) => setGroups(prev => prev.map(g => (g.id === id ? { ...g, ...fields } : g)));
-
   // ── Validation: the schema rules, checked before any YAML is written ─────
   const problems = [];
   const names = cleanGroups.map(g => g.name.trim());
@@ -144,12 +175,13 @@ export default function Wizard({ onApply, rulesetId, onRulesetChange }) {
   if (mgmt.ip && !/^\d+\.\d+\.\d+\.\d+\/\d+$/.test(mgmt.ip)) problems.push("Management IP must be CIDR, e.g. 192.168.1.10/24");
   if (mgmt.gw && !/^\d+\.\d+\.\d+\.\d+$/.test(mgmt.gw)) problems.push("Default gateway must be a plain IP, e.g. 192.168.1.1");
   if (mgmt.vlan && !(+mgmt.vlan >= 1 && +mgmt.vlan <= 4094)) problems.push("Management VLAN must be 1-4094.");
+  if (!members.length) problems.push("Add at least one stack member.");
   if (!cleanGroups.some(g => g.ports.length)) problems.push("Assign at least one port to a group.");
   const issues = [...new Set(problems)];
 
   const yaml = useMemo(
-    () => buildYAML({ model, module: mod, ruleset: rulesetId, mgmt, groups: cleanGroups.map(g => ({ ...g, name: g.name.trim() })), portsById }),
-    [model, mod, rulesetId, mgmt, cleanGroups, portsById]
+    () => buildYAML({ members, ruleset: rulesetId, mgmt, groups: cleanGroups.map(g => ({ ...g, name: g.name.trim() })), portsById }),
+    [members, rulesetId, mgmt, cleanGroups, portsById]
   );
   const assigned = cleanGroups.reduce((n, g) => n + g.ports.length, 0);
 
@@ -170,26 +202,53 @@ export default function Wizard({ onApply, rulesetId, onRulesetChange }) {
 
       {/* 1 ── Hardware */}
       <div style={card}>
-        <div style={stepTitle}><span style={badge}>1</span> Hardware</div>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
-          <div>
-            <label style={label}>Switch model</label>
-            <select value={model} onChange={e => setModel(e.target.value)} style={input}>
-              {SWITCH_MODELS.map(m => <option key={m} value={m}>{m}</option>)}
-            </select>
-            <div style={{ fontSize: 11, color: "#64748b", marginTop: 5 }}>{switchSummary(model)}</div>
-          </div>
-          <div>
-            <label style={label}>Network module <span style={{ color: "#475569", fontWeight: 400 }}>(optional)</span></label>
-            <select value={mod} onChange={e => setMod(e.target.value)} style={input}>
-              <option value="">— none —</option>
-              {compatible.map(m => <option key={m} value={m}>{m}</option>)}
-            </select>
-            <div style={{ fontSize: 11, color: "#64748b", marginTop: 5 }}>
-              {mod ? `${moduleSummary(mod)} — slot ${MODULE_SLOT}` : "No uplink module"}
-            </div>
-          </div>
+        <div style={stepTitle}>
+          <span style={badge}>1</span> Hardware
+          <span style={{ fontWeight: 400, color: "#64748b", fontSize: 12 }}>
+            — {isStack ? `stack of ${members.length}` : "standalone switch"}
+          </span>
         </div>
+
+        {members.map((m, i) => (
+          <div key={m.id} style={{ display: "grid", gridTemplateColumns: "42px 1fr 1fr auto", gap: 10, alignItems: "end", marginBottom: 10 }}>
+            <div>
+              <label style={label}>Mbr</label>
+              <div style={{ ...input, textAlign: "center", fontWeight: 700, color: "#3b82f6" }}>{i + 1}</div>
+            </div>
+            <div>
+              <label style={label}>Switch model</label>
+              <select value={m.model} onChange={e => patchMember(m.id, { model: e.target.value, module: "" })} style={input}>
+                {SWITCH_MODELS.map(x => <option key={x} value={x}>{x}</option>)}
+              </select>
+              <div style={{ fontSize: 11, color: "#64748b", marginTop: 4 }}>{switchSummary(m.model)}</div>
+            </div>
+            <div>
+              <label style={label}>Network module <span style={{ color: "#475569", fontWeight: 400 }}>(optional)</span></label>
+              <select value={m.module} onChange={e => patchMember(m.id, { module: e.target.value })} style={input}>
+                <option value="">— none —</option>
+                {modulesFor(m.model).map(x => <option key={x} value={x}>{x}</option>)}
+              </select>
+              <div style={{ fontSize: 11, color: "#64748b", marginTop: 4 }}>
+                {m.module ? `${moduleSummary(m.module)} — slot ${i + 1}/${MODULE_SLOT}` : "No uplink module"}
+              </div>
+            </div>
+            <button onClick={() => setMembers(members.filter(x => x.id !== m.id))} disabled={members.length === 1}
+              title={members.length === 1 ? "A switch needs at least one member" : "Remove this member"}
+              style={{ padding: "7px 11px", borderRadius: 6, background: "none", cursor: members.length === 1 ? "not-allowed" : "pointer",
+                border: `1px solid ${members.length === 1 ? "#334155" : "#7f1d1d"}`, color: members.length === 1 ? "#334155" : "#f87171", fontSize: 12 }}>
+              ✕
+            </button>
+          </div>
+        ))}
+
+        <div style={{ display: "flex", gap: 10, alignItems: "center", marginTop: 4 }}>
+          <button onClick={() => setMembers([...members, newMember()])} disabled={members.length >= MAX_MEMBERS}
+            style={{ ...ghostBtn, cursor: members.length >= MAX_MEMBERS ? "not-allowed" : "pointer" }}>
+            + Add stack member
+          </button>
+          {members.length >= MAX_MEMBERS && <span style={{ fontSize: 11, color: "#64748b" }}>Stack limit reached ({MAX_MEMBERS}).</span>}
+        </div>
+
         <div style={{ marginTop: 14 }}>
           <label style={label}>Ruleset <span style={{ color: "#475569", fontWeight: 400 }}>— which commands get emitted</span></label>
           <select value={rulesetId} onChange={e => onRulesetChange(e.target.value)} style={input}>
@@ -238,25 +297,40 @@ export default function Wizard({ onApply, rulesetId, onRulesetChange }) {
             );
           })}
           <button onClick={() => { const g = newGroup(groups.length + 1); setGroups([...groups, g]); setActiveId(g.id); }}
-            style={{ padding: "6px 12px", borderRadius: 7, cursor: "pointer", fontSize: 12, background: "none", border: "1px dashed #475569", color: "#64748b" }}>
+            style={ghostBtn}>
             + Add group
           </button>
         </div>
 
-        {/* Port grid */}
+        {/* Port grid — one block per stack member */}
         <div style={{ background: "#0d1117", border: "1px solid #334155", borderRadius: 8, padding: 12, marginBottom: 14 }}>
-          <div style={{ fontSize: 11, color: "#64748b", marginBottom: 7 }}>{model} — onboard ports</div>
-          <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
-            {allPorts.filter(p => !p.isModule).map(p => <PortButton key={p.id} p={p} />)}
-          </div>
-          {mod && (
-            <>
-              <div style={{ fontSize: 11, color: "#64748b", margin: "12px 0 7px" }}>{mod} — uplink module, slot {MODULE_SLOT}</div>
-              <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
-                {allPorts.filter(p => p.isModule).map(p => <PortButton key={p.id} p={p} />)}
+          {members.map((m, i) => {
+            const member = i + 1;
+            const onboard = allPorts.filter(p => p.member === member && !p.isModule);
+            const modPorts = allPorts.filter(p => p.member === member && p.isModule);
+            return (
+              <div key={m.id} style={{ marginTop: i === 0 ? 0 : 16 }}>
+                <div style={{ fontSize: 11, color: "#64748b", marginBottom: 7 }}>
+                  {isStack && <span style={{ color: "#3b82f6", fontWeight: 700 }}>Member {member} · </span>}
+                  {m.model} — onboard ports
+                </div>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+                  {onboard.map(p => <PortButton key={p.id} p={p} />)}
+                </div>
+                {m.module && (
+                  <>
+                    <div style={{ fontSize: 11, color: "#64748b", margin: "10px 0 7px" }}>
+                      {isStack && <span style={{ color: "#3b82f6", fontWeight: 700 }}>Member {member} · </span>}
+                      {m.module} — uplink module, slot {member}/{MODULE_SLOT}
+                    </div>
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+                      {modPorts.map(p => <PortButton key={p.id} p={p} />)}
+                    </div>
+                  </>
+                )}
               </div>
-            </>
-          )}
+            );
+          })}
         </div>
 
         {/* Active group settings */}

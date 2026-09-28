@@ -31,6 +31,36 @@
         "shutdownFalse": ["no shutdown"]
       }
     },
+    "campus-strict": {
+      "name": "Campus Strict",
+      "description": "Campus Access, but 802.1X only on copper and storm control on copper access ports. Shows what condition rules can express.",
+      "commands": {
+        "dot1x": [],
+        "access": ["switchport mode access"],
+        "trunk": ["switchport mode trunk"],
+        "portchannel": ["channel-group {cgNum} mode {cgMode}"],
+        "shutdownTrue": ["shutdown"],
+        "shutdownFalse": ["no shutdown"]
+      },
+      "rules": [
+        {
+          "when": { "mode": "Access", "dot1x": true, "portType": "RJ45", "interface": "physical" },
+          "commands": [
+            "authentication port-control auto",
+            "dot1x pae authenticator",
+            "spanning-tree portfast"
+          ]
+        },
+        {
+          "when": { "mode": "Access", "portType": "RJ45", "interface": "physical" },
+          "commands": ["storm-control broadcast level 5.00"]
+        },
+        {
+          "when": { "mode": "Trunk", "portType": ["QSFP28", "SFP28"] },
+          "commands": ["load-interval 30"]
+        }
+      ]
+    },
     "dc-edge": {
       "name": "Datacenter Edge",
       "description": "Trunk-heavy. No dot1x, no DTP negotiation on uplinks.",

@@ -62,21 +62,33 @@ function toIndexedArray(ports) {
   return arr;
 }
 
+const toTypeArray = ports => {
+  const arr = [];
+  for (const p of ports) arr[p.port - 1] = p.type;
+  return arr;
+};
+
 // Keyed by MEMBER, not by model: a stack of two identical switches needs
 // member 2 to resolve to "…2/0/x", which a model-keyed map cannot express.
+// The parallel *Types maps let rulesets match on connector type; an uploaded
+// workbook has no type column, so those stay empty on the Excel path.
 export function buildHardwareMaps(devices = {}, modules = {}) {
-  const platforms = {};
+  const platforms = {}, platformTypes = {};
   for (const [memberKey, model] of Object.entries(devices)) {
     const member = parseInt(memberKey, 10);
     if (!Number.isFinite(member)) continue;
-    platforms[member] = toIndexedArray(switchPorts(model, member));
+    const ports = switchPorts(model, member);
+    platforms[member] = toIndexedArray(ports);
+    platformTypes[member] = toTypeArray(ports);
   }
-  const mods = {};
+  const mods = {}, moduleTypes = {};
   for (const [slotKey, moduleName] of Object.entries(modules)) {
     const member = parseInt(slotKey.split("/")[0], 10) || 1;
-    mods[slotKey] = toIndexedArray(modulePorts(moduleName, member));
+    const ports = modulePorts(moduleName, member);
+    mods[slotKey] = toIndexedArray(ports);
+    moduleTypes[slotKey] = toTypeArray(ports);
   }
-  return { platforms, modules: mods };
+  return { platforms, modules: mods, platformTypes, moduleTypes };
 }
 
 export default HW;
