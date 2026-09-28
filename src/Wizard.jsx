@@ -1,5 +1,6 @@
 import { useState, useMemo } from "react";
 import { SWITCH_MODELS, switchPorts, modulePorts, modulesFor, switchSummary, moduleSummary } from "./ref/hardware";
+import { RULESET_OPTIONS, rulesetSummary } from "./ref/rulesets";
 
 // Colors cycled per port group so the grid reads at a glance.
 const GROUP_COLORS = ["#3b82f6","#a3e635","#f97316","#a78bfa","#ec4899","#14b8a6","#facc15","#f87171"];
@@ -36,8 +37,12 @@ function compress(ports, isModule) {
 }
 
 // ── YAML emitter — the whole point: indentation is never hand-typed ────────
-function buildYAML({ model, module: mod, mgmt, groups, portsById }) {
-  const L = [`Devices:`, `  ${MEMBER}: ${model}`];
+function buildYAML({ model, module: mod, ruleset, mgmt, groups, portsById }) {
+  const L = [];
+  // Naming the ruleset in the file makes the config reproducible: whoever
+  // regenerates it gets the same commands without picking anything.
+  if (ruleset) L.push(`Ruleset: ${ruleset}`);
+  L.push(`Devices:`, `  ${MEMBER}: ${model}`);
   if (mod) L.push(`Modules:`, `  ${MODULE_SLOT}: ${mod}`);
   if (mgmt.ip || mgmt.vlan || mgmt.gw) {
     L.push(`Management:`);
@@ -71,7 +76,7 @@ const input = { background: "#0d1117", border: "1px solid #334155", borderRadius
 const stepTitle = { fontSize: 13, fontWeight: 700, color: "#e2e8f0", marginBottom: 12, display: "flex", alignItems: "center", gap: 8 };
 const badge = { background: "#3b82f6", color: "#fff", borderRadius: "50%", width: 20, height: 20, display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 700, flexShrink: 0 };
 
-export default function Wizard({ onApply }) {
+export default function Wizard({ onApply, rulesetId, onRulesetChange }) {
   const [model, setModel]       = useState(SWITCH_MODELS[0]);
   const [mod, setMod]           = useState("");
   const [mgmt, setMgmt]         = useState({ ip: "", vlan: "", gw: "" });
@@ -143,8 +148,8 @@ export default function Wizard({ onApply }) {
   const issues = [...new Set(problems)];
 
   const yaml = useMemo(
-    () => buildYAML({ model, module: mod, mgmt, groups: cleanGroups.map(g => ({ ...g, name: g.name.trim() })), portsById }),
-    [model, mod, mgmt, cleanGroups, portsById]
+    () => buildYAML({ model, module: mod, ruleset: rulesetId, mgmt, groups: cleanGroups.map(g => ({ ...g, name: g.name.trim() })), portsById }),
+    [model, mod, rulesetId, mgmt, cleanGroups, portsById]
   );
   const assigned = cleanGroups.reduce((n, g) => n + g.ports.length, 0);
 
@@ -184,6 +189,13 @@ export default function Wizard({ onApply }) {
               {mod ? `${moduleSummary(mod)} — slot ${MODULE_SLOT}` : "No uplink module"}
             </div>
           </div>
+        </div>
+        <div style={{ marginTop: 14 }}>
+          <label style={label}>Ruleset <span style={{ color: "#475569", fontWeight: 400 }}>— which commands get emitted</span></label>
+          <select value={rulesetId} onChange={e => onRulesetChange(e.target.value)} style={input}>
+            {RULESET_OPTIONS.map(r => <option key={r.id} value={r.id}>{r.name}</option>)}
+          </select>
+          <div style={{ fontSize: 11, color: "#64748b", marginTop: 5 }}>{rulesetSummary(rulesetId)}</div>
         </div>
       </div>
 

@@ -51,21 +51,25 @@ export function describe(blocks) {
 export const switchSummary = model => describe(HW.switches[model]?.interfaces || []);
 export const moduleSummary = name => describe(HW.modules[name]?.interfaces || []);
 
-// Interface maps in the shape generateConfig() already expects from Excel:
-// a port-indexed array (ifaces[port - 1]), keyed by model / "member/slot".
+export const isKnownModel  = model => Boolean(HW.switches[model]);
+export const isKnownModule = name  => Boolean(HW.modules[name]);
+
+// Interface maps in the shape generateConfig() expects: a port-indexed array
+// (ifaces[port - 1]), keyed by stack member number / "member/slot".
 function toIndexedArray(ports) {
   const arr = [];
   for (const p of ports) arr[p.port - 1] = p.name;
   return arr;
 }
 
+// Keyed by MEMBER, not by model: a stack of two identical switches needs
+// member 2 to resolve to "…2/0/x", which a model-keyed map cannot express.
 export function buildHardwareMaps(devices = {}, modules = {}) {
   const platforms = {};
   for (const [memberKey, model] of Object.entries(devices)) {
     const member = parseInt(memberKey, 10);
-    // generateConfig looks platforms up by model name, so a stack reusing one
-    // model across members would collide — key by model, first member wins.
-    if (!platforms[model]) platforms[model] = toIndexedArray(switchPorts(model, member));
+    if (!Number.isFinite(member)) continue;
+    platforms[member] = toIndexedArray(switchPorts(model, member));
   }
   const mods = {};
   for (const [slotKey, moduleName] of Object.entries(modules)) {

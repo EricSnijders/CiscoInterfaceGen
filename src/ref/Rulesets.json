@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "description": "Named command rulesets. Each ruleset supplies the IOS commands emitted per condition. Edit these in git so a whole team generates identical config; {cgNum} and {cgMode} are substituted from the port group's ChannelGroup / ChannelMode.",
+  "default": "campus-access",
+  "rulesets": {
+    "campus-access": {
+      "name": "Campus Access",
+      "description": "Standard access layer: dot1x on user ports, portfast, LACP uplinks.",
+      "commands": {
+        "dot1x": [
+          "authentication port-control auto",
+          "dot1x pae authenticator",
+          "spanning-tree portfast"
+        ],
+        "access": ["switchport mode access"],
+        "trunk": ["switchport mode trunk"],
+        "portchannel": ["channel-group {cgNum} mode {cgMode}"],
+        "shutdownTrue": ["shutdown"],
+        "shutdownFalse": ["no shutdown"]
+      }
+    },
+    "lab-open": {
+      "name": "Lab / Open",
+      "description": "No 802.1X. Portfast on every access port so lab kit comes up immediately.",
+      "commands": {
+        "dot1x": [],
+        "access": ["switchport mode access", "spanning-tree portfast"],
+        "trunk": ["switchport mode trunk"],
+        "portchannel": ["channel-group {cgNum} mode {cgMode}"],
+        "shutdownTrue": ["shutdown"],
+        "shutdownFalse": ["no shutdown"]
+      }
+    },
+    "dc-edge": {
+      "name": "Datacenter Edge",
+      "description": "Trunk-heavy. No dot1x, no DTP negotiation on uplinks.",
+      "commands": {
+        "dot1x": [],
+        "access": ["switchport mode access"],
+        "trunk": ["switchport mode trunk", "switchport nonegotiate"],
+        "portchannel": ["channel-group {cgNum} mode {cgMode}"],
+        "shutdownTrue": ["shutdown"],
+        "shutdownFalse": ["no shutdown"]
+      }
+    }
+  }
+}

@@ -3,16 +3,13 @@ import * as XLSX from "xlsx";
 import Editor, { useMonaco } from "@monaco-editor/react";
 import Wizard from "./Wizard";
 import { buildHardwareMaps } from "./ref/hardware";
+import {
+  RULESET_IDS, RULESET_OPTIONS, DEFAULT_RULESET_ID, isKnownRuleset,
+  rulesetCommands, rulesetName, rulesetSummary, toRulesetJSON,
+} from "./ref/rulesets";
 
 // ── Default command sets ───────────────────────────────────────────────────
-const INITIAL_DEFAULTS = {
-  dot1x:        ["authentication port-control auto","dot1x pae authenticator","spanning-tree portfast"],
-  access:       ["switchport mode access"],
-  trunk:        ["switchport mode trunk"],
-  portchannel:  ["channel-group {cgNum} mode {cgMode}"],
-  shutdownTrue: ["shutdown"],
-  shutdownFalse:["no shutdown"],
-};
+// The commands themselves live in Rulesets.json; this is only their UI copy.
 const DEFAULTS_META = [
   { key: "dot1x",         label: "Dot1x = True",       hint: "Added to every access port when Dot1x: True" },
   { key: "access",        label: "Access mode",         hint: "Added to every access port (non-trunk)" },
@@ -23,7 +20,7 @@ const DEFAULTS_META = [
 ];
 
 // ── YAML schema: known keys per context ───────────────────────────────────
-const TOP_LEVEL_RESERVED = ["Devices", "Modules", "Management"];
+const TOP_LEVEL_RESERVED = ["Devices", "Modules", "Management", "Ruleset"];
 const PORT_GROUP_KEYS = ["Interfaces","Mode","VLAN","Dot1x","Shutdown","Description","UplinkModule","PortChannel","ChannelGroup","ChannelMode"];
 const BOOL_KEYS = new Set(["Dot1x","Shutdown","UplinkModule","PortChannel"]);
 const MODE_VALUES = ["Access","Trunk"];
@@ -59,7 +56,11 @@ function validateYAML(text) {
       const key = m[1].trim();
       const val = m[2].trim().replace(/^["']|["']$/g, "");
       if (key === "Devices") { hasDevices = true; topContext = "Devices"; currentGroup = null; }
-      else if (TOP_LEVEL_RESERVED.includes(key)) { topContext = key; currentGroup = null; }
+      else if (TOP_LEVEL_RESERVED.includes(key)) {
+        if (key === "Ruleset" && val && !isKnownRuleset(val))
+          mark(lineNum, `Unknown ruleset "${val}". Available: ${RULESET_IDS.join(", ")}`);
+        topContext = key; currentGroup = null;
+      }
       else { topContext = null; currentGroup = key; }
       continue;
     }
@@ -262,8 +263,10 @@ function resolveIface(sh, memberModelMap, excelMaps) {
     const [, member, port] = accessM.map(Number);
     const model = memberModelMap[member];
     if (!model) return `! UNRESOLVED_MEMBER(${sh})`;
-    const ifaces = excelMaps.platforms[model];
-    if (!ifaces?.length) return `! UNRESOLVED_PLATFORM(${sh}) — no tab for "${model}"`;
+    // Keyed by member so a stack of identical models resolves each member's
+    // own interface names rather than collapsing onto member 1's.
+    const ifaces = excelMaps.platforms[member];
+    if (!ifaces?.length) return `! UNRESOLVED_PLATFORM(${sh}) — no interface data for "${model}"`;
     return ifaces[port - 1] || `! UNRESOLVED_PORT(${sh})`;
   }
   return `! UNRESOLVED(${sh})`;
@@ -280,7 +283,7 @@ function applyVars(cmd, vars) {
 }
 
 // ── Config generator ───────────────────────────────────────────────────────
-function generateConfig(yaml, excelMaps, defaults) {
+function generateConfig(yaml, excelMaps, defaults, rulesetLabel) {
   const lines = [];
   const reservedKeys = new Set(TOP_LEVEL_RESERVED);
   const portChannelsDone = new Set();
@@ -306,6 +309,7 @@ function generateConfig(yaml, excelMaps, defaults) {
   if (yaml.Modules && Object.keys(yaml.Modules).length)
     for (const [slot, model] of Object.entries(yaml.Modules)) lines.push(`! Module ${slot}: ${model}`);
   if (mgmtVlan) lines.push(`! Management VLAN: ${mgmtVlan}${mgmtIPRaw ? `  IP: ${mgmtIPRaw}` : ""}${mgmtGW ? `  GW: ${mgmtGW}` : ""}`);
+  if (rulesetLabel) lines.push(`! Ruleset: ${rulesetLabel}`);
   lines.push(`! ================================================`);
   lines.push(`!`);
   if (mgmtGW) { lines.push(`ip default-gateway ${mgmtGW}`); lines.push(`!`); }
@@ -378,11 +382,15 @@ function generateConfig(yaml, excelMaps, defaults) {
 
 // ── Parse Excel ────────────────────────────────────────────────────────────
 function parseExcelMaps(wb, devices, modulesYaml) {
+  // Keyed by member to match buildHardwareMaps. A workbook still holds one tab
+  // per model, so members sharing a model read the same tab — the names in it
+  // are literal, exactly as the operator wrote them.
   const platforms = {};
-  for (const model of new Set(Object.values(devices))) {
+  for (const [memberKey, model] of Object.entries(devices || {})) {
+    const member = parseInt(memberKey, 10);
     const sheet = wb.Sheets[model];
-    if (!sheet) continue;
-    platforms[model] = XLSX.utils.sheet_to_json(sheet, { header: 1 })
+    if (!Number.isFinite(member) || !sheet) continue;
+    platforms[member] = XLSX.utils.sheet_to_json(sheet, { header: 1 })
       .filter(r => r?.[0] && typeof r[0] === "string").map(r => r[0].trim());
   }
   const modules = {};
@@ -435,7 +443,8 @@ Uplink:
 `;
 
 // ── Defaults Modal ─────────────────────────────────────────────────────────
-function DefaultsModal({ defaults, onSave, onClose }) {
+function DefaultsModal({ defaults, rulesetId, onSave, onClose }) {
+  const [copied, setCopied] = useState(false);
   const [local, setLocal] = useState(
     () => Object.fromEntries(Object.entries(defaults).map(([k, v]) => [k, v.join("\n")]))
   );
@@ -450,8 +459,10 @@ function DefaultsModal({ defaults, onSave, onClose }) {
       <div style={{ background: "#1e293b", border: "1px solid #334155", borderRadius: 12, width: 680, maxHeight: "85vh", display: "flex", flexDirection: "column", overflow: "hidden" }}>
         <div style={{ padding: "16px 20px", borderBottom: "1px solid #334155", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
           <div>
-            <div style={{ fontWeight: 700, fontSize: 15 }}>Command Defaults</div>
-            <div style={{ fontSize: 12, color: "#64748b", marginTop: 2 }}>Edit IOS commands per condition. One per line.</div>
+            <div style={{ fontWeight: 700, fontSize: 15 }}>Ruleset — {rulesetName(rulesetId)}</div>
+            <div style={{ fontSize: 12, color: "#64748b", marginTop: 2 }}>
+              Edit IOS commands per condition, one per line. Changes apply to this session only.
+            </div>
           </div>
           <button onClick={onClose} style={{ background: "none", border: "none", color: "#64748b", fontSize: 20, cursor: "pointer" }}>✕</button>
         </div>
@@ -470,10 +481,21 @@ function DefaultsModal({ defaults, onSave, onClose }) {
             </div>
             <textarea value={local[activeKey]} onChange={e => setLocal(prev => ({ ...prev, [activeKey]: e.target.value }))} spellCheck={false}
               style={{ fontFamily: "monospace", fontSize: 13, lineHeight: 1.7, background: "#0d1117", color: "#a3e635", border: "1px solid #334155", borderRadius: 8, padding: 14, flex: 1, minHeight: 180, resize: "vertical", outline: "none", width: "100%", boxSizing: "border-box" }} />
-            <button onClick={() => setLocal(prev => ({ ...prev, [activeKey]: INITIAL_DEFAULTS[activeKey].join("\n") }))}
-              style={{ alignSelf: "flex-start", padding: "5px 12px", borderRadius: 6, background: "none", border: "1px solid #475569", color: "#64748b", cursor: "pointer", fontSize: 12 }}>
-              ↺ Reset this section
-            </button>
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <button onClick={() => setLocal(prev => ({ ...prev, [activeKey]: rulesetCommands(rulesetId)[activeKey].join("\n") }))}
+                style={{ padding: "5px 12px", borderRadius: 6, background: "none", border: "1px solid #475569", color: "#64748b", cursor: "pointer", fontSize: 12 }}>
+                ↺ Reset this section
+              </button>
+              {/* Makes an in-session tweak reviewable: paste into Rulesets.json, open a PR. */}
+              <button onClick={() => {
+                const commands = Object.fromEntries(Object.entries(local).map(([k, v]) => [k, v.split("\n").map(s => s.trim()).filter(Boolean)]));
+                navigator.clipboard?.writeText(toRulesetJSON(rulesetId, commands));
+                setCopied(true); setTimeout(() => setCopied(false), 2000);
+              }}
+                style={{ padding: "5px 12px", borderRadius: 6, background: "none", border: "1px solid #475569", color: copied ? "#a3e635" : "#64748b", cursor: "pointer", fontSize: 12 }}>
+                {copied ? "✓ Copied" : "⧉ Copy JSON for Rulesets.json"}
+              </button>
+            </div>
           </div>
         </div>
         <div style={{ padding: "14px 20px", borderTop: "1px solid #334155", display: "flex", justifyContent: "flex-end", gap: 10 }}>
@@ -493,7 +515,8 @@ export default function App() {
   const [config, setConfig]             = useState("");
   const [error, setError]               = useState("");
   const [dragging, setDragging]         = useState(false);
-  const [defaults, setDefaults]         = useState(INITIAL_DEFAULTS);
+  const [rulesetId, setRulesetId]       = useState(DEFAULT_RULESET_ID);
+  const [defaults, setDefaults]         = useState(() => rulesetCommands(DEFAULT_RULESET_ID));
   const [showDefaults, setShowDefaults] = useState(false);
   const [showRef, setShowRef]           = useState(false);
   const [markers, setMarkers]           = useState([]);
@@ -514,7 +537,7 @@ export default function App() {
         root: [
           [/^\s*#.*$/, "comment"],
           [/^[A-Za-z][A-Za-z0-9_-]*(?=\s*:)/, "keyword.section"],
-          [/^\s{2}[A-Za-z][A-Za-z0-9_\/\-]*(?=\s*:)/, "keyword.field"],
+          [/^\s{2}[A-Za-z][A-Za-z0-9_/-]*(?=\s*:)/, "keyword.field"],
           [/:\s*(True|False|true|false)/, ["delimiter", "constant.language"]],
           [/:\s*(\d+)/, ["delimiter", "number"]],
           [/:\s*"[^"]*"/, ["delimiter", "string"]],
@@ -578,22 +601,36 @@ export default function App() {
       const yaml = parseYAML(text);
       const mgmt = yaml.Management || {};
       if (mgmt.IP && !parseIPCIDR(mgmt.IP)) throw new Error(`Invalid IP: "${mgmt.IP}"`);
+      // The YAML names the ruleset, so a committed file regenerates identically
+      // on anyone's machine. In-session edits apply only to the selected one.
+      const rsId = yaml.Ruleset || rulesetId;
+      if (!isKnownRuleset(rsId))
+        throw new Error(`Unknown ruleset "${rsId}". Available: ${RULESET_IDS.join(", ")}`);
+      const commands = rsId === rulesetId ? defaults : rulesetCommands(rsId);
+
       let ifaceMaps;
+      const members = Object.entries(yaml.Devices || {});
       if (workbook) {
         // An uploaded workbook overrides the built-in hardware library.
         ifaceMaps = parseExcelMaps(workbook, yaml.Devices, yaml.Modules);
-        const missing = [...new Set(Object.values(yaml.Devices||{}))].filter(m => !ifaceMaps.platforms[m]);
-        if (missing.length) throw new Error(`No Excel tab for: ${missing.join(", ")}. Available: ${workbook.SheetNames.join(", ")}`);
+        const missing = members.filter(([m]) => !ifaceMaps.platforms[parseInt(m, 10)]?.length);
+        if (missing.length) throw new Error(
+          `No Excel tab for: ${missing.map(([m, mdl]) => `member ${m} (${mdl})`).join(", ")}. Available tabs: ${workbook.SheetNames.join(", ")}`);
       } else {
         ifaceMaps = buildHardwareMaps(yaml.Devices, yaml.Modules);
-        const missing = [...new Set(Object.values(yaml.Devices||{}))].filter(m => !ifaceMaps.platforms[m]?.length);
-        if (missing.length) throw new Error(`Unknown model(s) in Switch_Hardware.json: ${missing.join(", ")}`);
+        const missing = members.filter(([m]) => !ifaceMaps.platforms[parseInt(m, 10)]?.length);
+        if (missing.length) throw new Error(
+          `Not in Switch_Hardware.json: ${missing.map(([m, mdl]) => `member ${m} (${mdl})`).join(", ")}`);
       }
-      setConfig(generateConfig(yaml, ifaceMaps, defaults));
+      setConfig(generateConfig(yaml, ifaceMaps, commands, rulesetName(rsId)));
     } catch (e) { setError(e.message); setConfig(""); }
   };
 
   const handleGenerate = () => runGenerate(yamlText);
+
+  // Switching ruleset reloads its commands from Rulesets.json, dropping any
+  // in-session edits to the previous one.
+  const selectRuleset = id => { setRulesetId(id); setDefaults(rulesetCommands(id)); };
 
   // Wizard hands over finished YAML: show it in the editor and generate.
   const handleWizardApply = text => { setYamlText(text); setMode("yaml"); runGenerate(text); };
@@ -616,7 +653,7 @@ export default function App() {
 
   return (
     <div style={{ fontFamily: "system-ui, sans-serif", background: "#0f172a", height: "100vh", overflow: "hidden", color: "#e2e8f0" }}>
-      {showDefaults && <DefaultsModal defaults={defaults} onSave={setDefaults} onClose={() => setShowDefaults(false)} />}
+      {showDefaults && <DefaultsModal defaults={defaults} rulesetId={rulesetId} onSave={setDefaults} onClose={() => setShowDefaults(false)} />}
 
       {/* Header */}
       <div style={{ background: "#1e293b", borderBottom: "1px solid #334155", padding: "13px 24px", display: "flex", alignItems: "center", gap: 12 }}>
@@ -634,7 +671,11 @@ export default function App() {
             </button>
           ))}
         </div>
-        <button onClick={() => setShowDefaults(true)} style={{ ...btnSecondary, borderColor: "#475569", color: "#cbd5e1" }}>⚙ Edit Defaults</button>
+        <select value={rulesetId} onChange={e => selectRuleset(e.target.value)} title={rulesetSummary(rulesetId)}
+          style={{ background: "#0f172a", border: "1px solid #334155", borderRadius: 8, color: "#cbd5e1", padding: "8px 10px", fontSize: 13, outline: "none" }}>
+          {RULESET_OPTIONS.map(r => <option key={r.id} value={r.id}>📋 {r.name}</option>)}
+        </select>
+        <button onClick={() => setShowDefaults(true)} style={{ ...btnSecondary, borderColor: "#475569", color: "#cbd5e1" }}>⚙ Edit Ruleset</button>
       </div>
 
       <div style={{ padding: "24px 40px", width: "100%", boxSizing: "border-box", display: "grid", gridTemplateColumns: "1fr 1fr", gap: 28, height: "calc(100vh - 62px)" }}>
@@ -642,7 +683,7 @@ export default function App() {
         {/* LEFT */}
         <div style={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }}>
 
-          {mode === "wizard" ? <Wizard onApply={handleWizardApply} /> : <>
+          {mode === "wizard" ? <Wizard onApply={handleWizardApply} rulesetId={rulesetId} onRulesetChange={selectRuleset} /> : <>
 
           {/* Top scrollable: Excel + quick ref */}
           <div style={{ flexShrink: 0, display: "flex", flexDirection: "column", gap: 16, paddingBottom: 16 }}>
