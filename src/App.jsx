@@ -1,6 +1,8 @@
 import { useState, useCallback, useRef, useEffect } from "react";
 import * as XLSX from "xlsx";
 import Editor, { useMonaco } from "@monaco-editor/react";
+import Wizard from "./Wizard";
+import { buildHardwareMaps } from "./ref/hardware";
 
 // ── Default command sets ───────────────────────────────────────────────────
 const INITIAL_DEFAULTS = {
@@ -432,14 +434,6 @@ Uplink:
   Description: "Uplink to Core"
 `;
 
-const SAMPLE_EXCEL_MAPS = {
-  platforms: {
-    "C9300-24P": Array.from({ length: 24 }, (_, i) => `GigabitEthernet1/0/${i + 1}`),
-    "C9300-48P": Array.from({ length: 48 }, (_, i) => `GigabitEthernet2/0/${i + 1}`),
-  },
-  modules: { "1/1": Array.from({ length: 8 }, (_, i) => `TenGigabitEthernet1/1/${i + 1}`) }
-};
-
 // ── Defaults Modal ─────────────────────────────────────────────────────────
 function DefaultsModal({ defaults, onSave, onClose }) {
   const [local, setLocal] = useState(
@@ -503,6 +497,8 @@ export default function App() {
   const [showDefaults, setShowDefaults] = useState(false);
   const [showRef, setShowRef]           = useState(false);
   const [markers, setMarkers]           = useState([]);
+  const [mode, setMode]                 = useState("wizard"); // "wizard" | "yaml"
+  const [editorReady, setEditorReady]   = useState(false);
   const yamlFileRef = useRef(null);
   const monaco = useMonaco();
   const editorRef = useRef(null);
@@ -547,14 +543,15 @@ export default function App() {
     });
   }, [monaco]);
 
-  // Live validation — runs on every YAML change
+  // Live validation — runs on every YAML change, and once the editor mounts
+  // (which happens late when arriving from the wizard).
   useEffect(() => {
     if (!monaco || !editorRef.current) return;
     const m = validateYAML(yamlText);
     setMarkers(m);
     const model = editorRef.current.getModel();
     if (model) monaco.editor.setModelMarkers(model, "cisco-yaml", m);
-  }, [yamlText, monaco]);
+  }, [yamlText, monaco, editorReady]);
 
   const handleExcel = async file => {
     const buf = await file.arrayBuffer();
@@ -571,25 +568,35 @@ export default function App() {
     e.target.value = "";
   };
 
-  const handleGenerate = () => {
-    const errors = markers.filter(m => m.severity === 8);
+  // Validates `text` directly rather than the markers state, so generating
+  // straight from the wizard doesn't race the validation effect.
+  const runGenerate = text => {
+    const errors = validateYAML(text).filter(m => m.severity === 8);
     if (errors.length) { setError(`Fix ${errors.length} error(s) before generating.`); setConfig(""); return; }
     try {
       setError("");
-      const yaml = parseYAML(yamlText);
+      const yaml = parseYAML(text);
       const mgmt = yaml.Management || {};
       if (mgmt.IP && !parseIPCIDR(mgmt.IP)) throw new Error(`Invalid IP: "${mgmt.IP}"`);
-      let excelMaps;
+      let ifaceMaps;
       if (workbook) {
-        excelMaps = parseExcelMaps(workbook, yaml.Devices, yaml.Modules);
-        const missing = [...new Set(Object.values(yaml.Devices||{}))].filter(m => !excelMaps.platforms[m]);
+        // An uploaded workbook overrides the built-in hardware library.
+        ifaceMaps = parseExcelMaps(workbook, yaml.Devices, yaml.Modules);
+        const missing = [...new Set(Object.values(yaml.Devices||{}))].filter(m => !ifaceMaps.platforms[m]);
         if (missing.length) throw new Error(`No Excel tab for: ${missing.join(", ")}. Available: ${workbook.SheetNames.join(", ")}`);
       } else {
-        excelMaps = SAMPLE_EXCEL_MAPS;
+        ifaceMaps = buildHardwareMaps(yaml.Devices, yaml.Modules);
+        const missing = [...new Set(Object.values(yaml.Devices||{}))].filter(m => !ifaceMaps.platforms[m]?.length);
+        if (missing.length) throw new Error(`Unknown model(s) in Switch_Hardware.json: ${missing.join(", ")}`);
       }
-      setConfig(generateConfig(yaml, excelMaps, defaults));
+      setConfig(generateConfig(yaml, ifaceMaps, defaults));
     } catch (e) { setError(e.message); setConfig(""); }
   };
+
+  const handleGenerate = () => runGenerate(yamlText);
+
+  // Wizard hands over finished YAML: show it in the editor and generate.
+  const handleWizardApply = text => { setYamlText(text); setMode("yaml"); runGenerate(text); };
 
   const handleDownload = () => {
     const blob = new Blob([config], { type: "text/plain" });
@@ -616,7 +623,16 @@ export default function App() {
         <div style={{ background: "#3b82f6", borderRadius: 8, width: 34, height: 34, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 17 }}>⚙</div>
         <div style={{ flex: 1 }}>
           <div style={{ fontWeight: 700, fontSize: 16 }}>Cisco IOS Config Generator</div>
-          <div style={{ fontSize: 12, color: "#64748b" }}>YAML + Excel platform library → IOS .cfg</div>
+          <div style={{ fontSize: 12, color: "#64748b" }}>Pick hardware → IOS .cfg · YAML generated for you</div>
+        </div>
+        <div style={{ display: "flex", background: "#0f172a", border: "1px solid #334155", borderRadius: 8, padding: 3, gap: 3 }}>
+          {[["wizard", "🧭 Wizard"], ["yaml", "📝 YAML"]].map(([m, lbl]) => (
+            <button key={m} onClick={() => setMode(m)}
+              style={{ padding: "6px 14px", borderRadius: 6, border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600,
+                background: mode === m ? "#3b82f6" : "transparent", color: mode === m ? "#fff" : "#94a3b8" }}>
+              {lbl}
+            </button>
+          ))}
         </div>
         <button onClick={() => setShowDefaults(true)} style={{ ...btnSecondary, borderColor: "#475569", color: "#cbd5e1" }}>⚙ Edit Defaults</button>
       </div>
@@ -626,13 +642,15 @@ export default function App() {
         {/* LEFT */}
         <div style={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }}>
 
+          {mode === "wizard" ? <Wizard onApply={handleWizardApply} /> : <>
+
           {/* Top scrollable: Excel + quick ref */}
           <div style={{ flexShrink: 0, display: "flex", flexDirection: "column", gap: 16, paddingBottom: 16 }}>
 
             {/* Excel upload */}
             <div>
               <div style={{ fontSize: 13, fontWeight: 600, color: "#94a3b8", marginBottom: 8 }}>
-                1. Platform Excel <span style={{ color: "#475569", fontWeight: 400 }}>(optional — sample data if omitted)</span>
+                1. Platform Excel <span style={{ color: "#475569", fontWeight: 400 }}>(optional — overrides Switch_Hardware.json)</span>
               </div>
               <div onDragOver={e => { e.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={onDrop}
                 onClick={() => document.getElementById("xlFile").click()}
@@ -696,7 +714,7 @@ export default function App() {
                 theme="cisco-dark"
                 value={yamlText}
                 onChange={v => setYamlText(v || "")}
-                onMount={editor => { editorRef.current = editor; }}
+                onMount={editor => { editorRef.current = editor; setEditorReady(true); }}
                 options={{
                   fontSize: 13,
                   lineHeight: 22,
@@ -735,6 +753,7 @@ export default function App() {
             </button>
             {error && <div style={{ marginTop: 8, background: "#450a0a", border: "1px solid #b91c1c", borderRadius: 8, padding: 12, color: "#fca5a5", fontSize: 13 }}>⚠ {error}</div>}
           </div>
+          </>}
         </div>
 
         {/* RIGHT */}

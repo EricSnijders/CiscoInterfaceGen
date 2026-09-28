@@ -1,0 +1,130 @@
+{
+  "schemaVersion": 1,
+  "description": "Cisco hardware interface inventory. Use {port} in namePattern to construct an interface name.",
+  "switches": {
+    "C9300-24P": {
+      "interfaces": [
+        {
+          "namePattern": "GigabitEthernet1/0/{port}",
+          "portRange": {
+            "start": 1,
+            "end": 24
+          },
+          "type": "RJ45"
+        }
+      ]
+    },
+    "C9300-24UX": {
+      "interfaces": [
+        {
+          "namePattern": "TenGigabitEthernet1/0/{port}",
+          "portRange": {
+            "start": 1,
+            "end": 24
+          },
+          "type": "RJ45"
+        }
+      ]
+    },
+    "C9300-48P": {
+      "interfaces": [
+        {
+          "namePattern": "GigabitEthernet1/0/{port}",
+          "portRange": {
+            "start": 1,
+            "end": 48
+          },
+          "type": "RJ45"
+        }
+      ]
+    },
+    "C9300-48UXM": {
+      "interfaces": [
+        {
+          "namePattern": "TwoGigabitEthernet1/0/{port}",
+          "portRange": {
+            "start": 1,
+            "end": 36
+          },
+          "type": "RJ45"
+        },
+        {
+          "namePattern": "TenGigabitEthernet1/0/{port}",
+          "portRange": {
+            "start": 37,
+            "end": 48
+          },
+          "type": "RJ45"
+        }
+      ]
+    },
+    "C9500-24Y4C": {
+      "interfaces": [
+        {
+          "namePattern": "TwentyFiveGigE1/0/{port}",
+          "portRange": {
+            "start": 1,
+            "end": 24
+          },
+          "type": "SFP28"
+        },
+        {
+          "namePattern": "HundredGigE1/0/{port}",
+          "portRange": {
+            "start": 25,
+            "end": 28
+          },
+          "type": "QSFP28"
+        }
+      ]
+    },
+    "C9500-48Y4C": {
+      "interfaces": [
+        {
+          "namePattern": "TwentyFiveGigE1/0/{port}",
+          "portRange": {
+            "start": 1,
+            "end": 48
+          },
+          "type": "SFP28"
+        },
+        {
+          "namePattern": "HundredGigE1/0/{port}",
+          "portRange": {
+            "start": 49,
+            "end": 52
+          },
+          "type": "QSFP28"
+        }
+      ]
+    }
+  },
+  "modules": {
+    "NM-4G": {
+      "interfaces": [
+        {
+          "namePattern": "GigabitEthernet1/1/{port}",
+          "portRange": {
+            "start": 1,
+            "end": 4
+          },
+          "type": "SFP"
+        }
+      ],
+      "compatibleWith": []
+    },
+    "NM-8X": {
+      "interfaces": [
+        {
+          "namePattern": "TenGigabitEthernet1/1/{port}",
+          "portRange": {
+            "start": 1,
+            "end": 8
+          },
+          "type": "SFP+"
+        }
+      ],
+      "compatibleWith": []
+    }
+  }
+}
