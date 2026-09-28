@@ -48,7 +48,18 @@ export const MANAGEMENT_INTERFACES = ["vlan", "loopback"];
 export const DEVICE_TOGGLE_KEYS = ["key", "label", "commands", "hint"];
 
 // portDefaults: initial state of a newly added port group in the wizard.
-export const PORT_DEFAULT_KEYS = ["dot1x", "shutdown"];
+// channelMode is the mode filled in when Port-channel is ticked.
+export const PORT_DEFAULT_KEYS = ["dot1x", "shutdown", "channelMode"];
+export const PORT_DEFAULT_BOOLEANS = ["dot1x", "shutdown"];
+
+// portRoles: ports that exist for a device feature rather than for traffic —
+// StackWise Virtual links, dual-active detection. A role replaces the normal
+// mode/dot1x/shutdown emission with its own commands, and the wizard can pick
+// the ports for it. Roles consume ports from the tail of a member's list in
+// declaration order, so SVL taking 23-24 leaves DAD on 22.
+export const PORT_ROLE_KEYS = ["label", "requiresToggle", "select", "range", "commands"];
+export const ROLE_SELECT_KEYS = ["perMember", "from"];
+export const ROLE_FROM = ["onboard", "module"];
 
 // uplinks: how the wizard picks uplink ports and bundles them.
 export const UPLINK_KEYS = [

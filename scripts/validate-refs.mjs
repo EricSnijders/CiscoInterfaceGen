@@ -13,6 +13,7 @@ import {
   COMMAND_KEYS, RULE_FACTS, FACT_VALUES, BOOLEAN_FACTS,
   NAMING_KEYS, PORT_DEFAULT_KEYS, UPLINK_KEYS, UPLINK_PREFER, CHANNEL_MODE_VALUES,
   MANAGEMENT_KEYS, MANAGEMENT_INTERFACES, DEVICE_TOGGLE_KEYS,
+  PORT_DEFAULT_BOOLEANS, PORT_ROLE_KEYS, ROLE_SELECT_KEYS, ROLE_FROM,
 } from "../src/ref/schema.js";
 
 const REF = join(dirname(fileURLToPath(import.meta.url)), "..", "src", "ref");
@@ -133,8 +134,11 @@ function checkSections(file, id, def) {
     else {
       unknown("portDefaults", pd, PORT_DEFAULT_KEYS);
       for (const [k, v] of Object.entries(pd))
-        if (PORT_DEFAULT_KEYS.includes(k) && typeof v !== "boolean")
+        if (PORT_DEFAULT_BOOLEANS.includes(k) && typeof v !== "boolean")
           fail(file, `${id}.portDefaults.${k}: must be true or false`);
+      if (pd.channelMode !== undefined &&
+          !CHANNEL_MODE_VALUES.some(m => m.toLowerCase() === String(pd.channelMode).toLowerCase()))
+        fail(file, `${id}.portDefaults.channelMode: must be one of ${CHANNEL_MODE_VALUES.join(", ")}`);
     }
   }
 
@@ -171,6 +175,38 @@ function checkSections(file, id, def) {
       else if (!t.commands.length)
         fail(file, `${at}.commands: is empty, so the toggle does nothing`);
     });
+  }
+
+  const roles = def.portRoles;
+  if (roles !== undefined) {
+    if (typeof roles !== "object" || roles === null || Array.isArray(roles))
+      fail(file, `${id}.portRoles: must be an object keyed by role name`);
+    else for (const [name, r] of Object.entries(roles)) {
+      const at = `${id}.portRoles.${name}`;
+      if (!/^[A-Za-z][A-Za-z0-9]*$/.test(name))
+        fail(file, `${at}: role name must be letters and digits — it is typed into YAML as Role: ${name}`);
+      if (typeof r !== "object" || r === null || Array.isArray(r)) { fail(file, `${at}: must be an object`); continue; }
+      unknown(`portRoles.${name}`, r, PORT_ROLE_KEYS);
+      if (!Array.isArray(r.commands) || !r.commands.every(c => typeof c === "string") || !r.commands.length)
+        fail(file, `${at}.commands: must be a non-empty array of command strings`);
+      if (r.range !== undefined && typeof r.range !== "boolean")
+        fail(file, `${at}.range: must be true or false`);
+      // A toggle that does not exist would hide the role's button forever.
+      if (r.requiresToggle !== undefined &&
+          !(def.deviceToggles || []).some(t => t.key === r.requiresToggle))
+        fail(file, `${at}.requiresToggle: "${r.requiresToggle}" is not a deviceToggle of this ruleset`);
+      const sel = r.select;
+      if (sel !== undefined) {
+        if (typeof sel !== "object" || sel === null || Array.isArray(sel)) fail(file, `${at}.select: must be an object`);
+        else {
+          unknown(`portRoles.${name}.select`, sel, ROLE_SELECT_KEYS);
+          if (sel.perMember !== undefined && (!Number.isInteger(sel.perMember) || sel.perMember < 1))
+            fail(file, `${at}.select.perMember: must be a whole number of 1 or more`);
+          if (sel.from !== undefined && !ROLE_FROM.includes(sel.from))
+            fail(file, `${at}.select.from: must be one of ${ROLE_FROM.join(", ")}`);
+        }
+      }
+    }
   }
 
   const up = def.uplinks;

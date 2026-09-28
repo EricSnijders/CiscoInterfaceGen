@@ -91,13 +91,28 @@ export const ALL_DEVICE_TOGGLE_KEYS = [...new Set(
   Object.values(RS.rulesets || {}).flatMap(r => (r.deviceToggles || []).map(t => t.key)).filter(Boolean)
 )];
 
+export const rulesetPortRoles = id => RS.rulesets[id]?.portRoles || {};
+
+// Roles are matched case-insensitively, since they are typed into YAML.
+export function rulesetPortRole(id, role) {
+  const roles = rulesetPortRoles(id);
+  const key = Object.keys(roles).find(k => k.toLowerCase() === String(role).toLowerCase());
+  return key ? { ...roles[key], name: key } : null;
+}
+
+export const ALL_PORT_ROLES = [...new Set(
+  Object.values(RS.rulesets || {}).flatMap(r => Object.keys(r.portRoles || {}))
+)];
+
 // A group's Description as it should appear on the interface. Trunks take
 // uplinkPrefix, everything else takes prefix. Any convention prefix already
 // present is stripped first, so flipping a group between access and trunk
 // re-labels it rather than stacking ";" and "U;".
-export function formatDescription(desc, { mode, dot1x }, naming = {}) {
+export function formatDescription(desc, { mode, dot1x, role }, naming = {}) {
   const { prefix = "", uplinkPrefix = "", noDot1xSuffix = "" } = naming;
-  const isTrunk = String(mode).toLowerCase() === "trunk";
+  // A role port carries neither traffic mode nor dot1x, so it takes the plain
+  // prefix and is never marked as unsecured.
+  const isTrunk = !role && String(mode).toLowerCase() === "trunk";
   const wanted = isTrunk && uplinkPrefix ? uplinkPrefix : prefix;
 
   let out = String(desc ?? "");
@@ -107,7 +122,7 @@ export function formatDescription(desc, { mode, dot1x }, naming = {}) {
 
   // ZB marks an access port deliberately left without 802.1X. A trunk was
   // never a candidate for dot1x, so it is not marked.
-  const unsecured = !isTrunk && !dot1x;
+  const unsecured = !isTrunk && !role && !dot1x;
   if (noDot1xSuffix && unsecured && !out.endsWith(noDot1xSuffix)) out = `${out} ${noDot1xSuffix}`;
   return out;
 }

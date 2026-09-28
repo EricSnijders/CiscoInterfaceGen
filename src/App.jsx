@@ -9,7 +9,7 @@ import {
   rulesetCommands, rulesetName, rulesetSummary, rulesetRuleCount,
   rulesetRules, matchesRule, toRulesetJSON, rulesetNaming, formatDescription,
   rulesetPortDefaults, rulesetUplinks, rulesetManagement, rulesetDeviceToggles,
-  ALL_DEVICE_TOGGLE_KEYS,
+  ALL_DEVICE_TOGGLE_KEYS, ALL_PORT_ROLES, rulesetPortRole,
 } from "./ref/rulesets";
 
 // ── Default command sets ───────────────────────────────────────────────────
@@ -27,7 +27,7 @@ const DEFAULTS_META = [
 // Device-toggle keys are reserved too, so a file naming one is not mistaken
 // for a port group.
 const TOP_LEVEL_RESERVED = ["Devices", "Modules", "Management", "Ruleset", ...ALL_DEVICE_TOGGLE_KEYS];
-const PORT_GROUP_KEYS = ["Interfaces","Mode","VLAN","Dot1x","Shutdown","Description","UplinkModule","PortChannel","ChannelGroup","ChannelMode","Range"];
+const PORT_GROUP_KEYS = ["Interfaces","Mode","VLAN","Dot1x","Shutdown","Description","UplinkModule","PortChannel","ChannelGroup","ChannelMode","Range","Role"];
 const BOOL_KEYS = new Set(["Dot1x","Shutdown","UplinkModule","PortChannel","Range"]);
 // IOS accepts at most five comma-separated ranges per "interface range".
 const MAX_RANGES_PER_COMMAND = 5;
@@ -105,6 +105,8 @@ function validateYAML(text) {
         // Match what the generator actually accepts, including YAML's yes/no.
         if (BOOL_KEYS.has(key) && val && !["true","false","yes","no"].includes(val.toLowerCase()))
           mark(lineNum, `"${key}" must be True or False`);
+        if (key === "Role" && val && !ALL_PORT_ROLES.some(r => r.toLowerCase() === val.toLowerCase()))
+          mark(lineNum, `Unknown Role "${val}". Valid: ${ALL_PORT_ROLES.join(", ") || "none defined"}`);
         if (key === "Mode" && val && !MODE_VALUES.map(v=>v.toLowerCase()).includes(val.toLowerCase()))
           mark(lineNum, `Mode must be Access or Trunk`);
         if (key === "VLAN" && val && (isNaN(parseInt(val)) || parseInt(val) < 1 || parseInt(val) > 4094))
@@ -303,7 +305,7 @@ function applyVars(cmd, vars) {
 }
 
 // ── Config generator ───────────────────────────────────────────────────────
-function generateConfig(yaml, excelMaps, { rules, label, naming, management, deviceToggles }) {
+function generateConfig(yaml, excelMaps, { rules, label, naming, management, deviceToggles, portRole }) {
   const lines = [];
   const reservedKeys = new Set(TOP_LEVEL_RESERVED);
   const portChannelsDone = new Set();
@@ -376,6 +378,9 @@ function generateConfig(yaml, excelMaps, { rules, label, naming, management, dev
     const dot1x = ["true","yes"].includes((grp.Dot1x||"").toLowerCase());
     const shutdown = ["true","yes"].includes((grp.Shutdown||"").toLowerCase());
     const rangeMode = ["true","yes"].includes((grp.Range||"").toLowerCase());
+    // A role port exists for a device feature, not for traffic: it takes the
+    // role's commands and skips the mode/dot1x/shutdown rules entirely.
+    const roleDef = grp.Role ? portRole?.(grp.Role) : null;
     const desc = grp.Description || groupName;
     const vlan = grp.VLAN || grp.Vlan || null;
 
@@ -384,7 +389,7 @@ function generateConfig(yaml, excelMaps, { rules, label, naming, management, dev
     const groupFacts = {
       mode: isUplink ? "Trunk" : "Access",
       dot1x, shutdown, portChannel: hasPc, uplinkModule: isUplinkMod,
-      hasVlan: Boolean(vlan),
+      hasVlan: Boolean(vlan), role: roleDef?.name || null,
     };
     const vars = { cgNum, cgMode, vlan: vlan || "", description: desc };
 
@@ -392,10 +397,14 @@ function generateConfig(yaml, excelMaps, { rules, label, naming, management, dev
 
     const emitCommands = facts => {
       lines.push(` description ${formatDescription(desc, facts, naming)}`);
-      for (const rule of rules) {
-        if (!matchesRule(rule.when, facts)) continue;
-        const rowVars = { ...vars, portType: facts.portType || "", member: facts.member ?? "", model: facts.model || "" };
-        for (const cmd of rule.commands) lines.push(` ${applyVars(cmd, rowVars)}`);
+      const rowVars = { ...vars, portType: facts.portType || "", member: facts.member ?? "", model: facts.model || "" };
+      if (roleDef) {
+        for (const cmd of roleDef.commands || []) lines.push(` ${applyVars(cmd, rowVars)}`);
+      } else {
+        for (const rule of rules) {
+          if (!matchesRule(rule.when, facts)) continue;
+          for (const cmd of rule.commands) lines.push(` ${applyVars(cmd, rowVars)}`);
+        }
       }
       lines.push(`!`);
     };
@@ -722,6 +731,7 @@ export default function App() {
         naming: rulesetNaming(rsId),
         management: rulesetManagement(rsId),
         deviceToggles: rulesetDeviceToggles(rsId),
+        portRole: role => rulesetPortRole(rsId, role),
       }));
     } catch (e) { setError(e.message); setConfig(""); }
   };

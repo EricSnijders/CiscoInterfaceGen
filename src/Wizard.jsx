@@ -1,7 +1,7 @@
 import { useState, useMemo } from "react";
 import { SWITCH_MODELS, switchPorts, modulePorts, modulesFor, switchSummary, moduleSummary } from "./ref/hardware";
 import { RULESET_OPTIONS, rulesetSummary, rulesetUplinks, rulesetPortDefaults, rulesetNaming,
-         rulesetManagement, rulesetDeviceToggles, formatDescription } from "./ref/rulesets";
+         rulesetManagement, rulesetDeviceToggles, rulesetPortRoles, formatDescription } from "./ref/rulesets";
 
 // Colors cycled per port group so the grid reads at a glance.
 const GROUP_COLORS = ["#3b82f6","#a3e635","#f97316","#a78bfa","#ec4899","#14b8a6","#facc15","#f87171"];
@@ -13,8 +13,8 @@ const newMember = () => ({ id: uid(), model: SWITCH_MODELS[0], module: "" });
 const newGroup  = (n, defaults = {}) => ({
   id: uid(), name: `Group${n}`, mode: "Access", vlan: "",
   dot1x: Boolean(defaults.dot1x), shutdown: Boolean(defaults.shutdown),
-  description: "", portChannel: false, rangeMode: false,
-  channelGroup: "1", channelMode: "Active", ports: [],
+  description: "", portChannel: false, rangeMode: false, role: "",
+  channelGroup: "1", channelMode: defaults.channelMode || "Active", ports: [],
 });
 
 // ── Uplink selection ───────────────────────────────────────────────────────
@@ -34,6 +34,26 @@ function uplinkPorts(members, allPorts, policy) {
   if (!policy) return [];
   if (members.length === 1) return pickUplinks(allPorts, 1, policy.prefer, policy.standaloneCount ?? 2);
   return members.flatMap((_, i) => pickUplinks(allPorts, i + 1, policy.prefer, policy.perMember ?? 1));
+}
+
+// Role ports are taken from the END of each member's list, in the order the
+// roles are declared: SVL claims the last two onboard ports (23, 24), then DAD
+// claims the next one still free (22).
+function rolePorts(members, allPorts, roles) {
+  const claimed = new Set();
+  const out = {};
+  for (const [name, def] of roles) {
+    const { perMember = 1, from = "onboard" } = def.select || {};
+    out[name] = members.flatMap((_, i) => {
+      const member = i + 1;
+      const pool = allPorts.filter(p =>
+        p.member === member && (from === "module" ? p.isModule : !p.isModule) && !claimed.has(p.id));
+      const take = pool.slice(-perMember);
+      take.forEach(p => claimed.add(p.id));
+      return take;
+    });
+  }
+  return out;
 }
 
 // ── Shorthand + range compression ──────────────────────────────────────────
@@ -101,13 +121,19 @@ function buildYAML({ members, ruleset, deviceFlags, mgmt, groups, portsById }) {
     const ports = g.ports.map(id => portsById[id]).filter(Boolean);
     L.push(``, `${g.name}:`);
     L.push(`  Interfaces: ${interfaceList(ports)}`);
-    L.push(`  Mode: ${g.mode}`);
-    if (g.mode === "Access" && g.vlan) L.push(`  VLAN: ${g.vlan}`);
-    if (ports.some(p => p.isModule)) L.push(`  UplinkModule: True`);
-    L.push(`  Dot1x: ${g.dot1x ? "True" : "False"}`);
-    L.push(`  Shutdown: ${g.shutdown ? "True" : "False"}`);
-    if (g.portChannel)
-      L.push(`  PortChannel: True`, `  ChannelGroup: ${g.channelGroup}`, `  ChannelMode: ${g.channelMode}`);
+    if (g.role) {
+      // Role ports take their commands from the ruleset; mode, VLAN and dot1x
+      // do not apply to them.
+      L.push(`  Role: ${g.role}`);
+    } else {
+      L.push(`  Mode: ${g.mode}`);
+      if (g.mode === "Access" && g.vlan) L.push(`  VLAN: ${g.vlan}`);
+      if (ports.some(p => p.isModule)) L.push(`  UplinkModule: True`);
+      L.push(`  Dot1x: ${g.dot1x ? "True" : "False"}`);
+      L.push(`  Shutdown: ${g.shutdown ? "True" : "False"}`);
+      if (g.portChannel)
+        L.push(`  PortChannel: True`, `  ChannelGroup: ${g.channelGroup}`, `  ChannelMode: ${g.channelMode}`);
+    }
     if (g.rangeMode) L.push(`  Range: True`);
     L.push(`  Description: "${(g.description || g.name).replace(/"/g, "'")}"`);
   }
@@ -167,6 +193,7 @@ export default function Wizard({ onApply, rulesetId, onRulesetChange }) {
 
   const uplinkPolicy = rulesetUplinks(rulesetId);
   const naming = rulesetNaming(rulesetId);
+  const portDefaults = rulesetPortDefaults(rulesetId);
   const management = rulesetManagement(rulesetId);
   const deviceToggles = rulesetDeviceToggles(rulesetId);
   const onLoopback = String(management.interface || "vlan").toLowerCase() === "loopback";
@@ -174,6 +201,39 @@ export default function Wizard({ onApply, rulesetId, onRulesetChange }) {
     () => uplinkPorts(members, allPorts, uplinkPolicy),
     [members, allPorts, uplinkPolicy]
   );
+
+  // Role groups offered by whichever device toggles are switched on.
+  const roleSets = useMemo(() => {
+    const all = Object.entries(rulesetPortRoles(rulesetId));
+    return deviceToggles
+      .filter(t => deviceFlags[t.key])
+      .map(t => ({ toggle: t, roles: all.filter(([, def]) => def.requiresToggle === t.key) }))
+      .filter(r => r.roles.length);
+  }, [rulesetId, deviceToggles, deviceFlags]);
+
+  const addRoleGroups = ({ roles }) => {
+    const picked = rolePorts(members, allPorts, roles);
+    const taken = new Set(cleanGroups.map(g => g.name.trim()));
+    const made = [];
+    for (const [name, def] of roles) {
+      const ids = (picked[name] || []).map(p => p.id);
+      if (!ids.length) continue;
+      let gname = name;
+      for (let i = 2; taken.has(gname); i++) gname = `${name}${i}`;
+      taken.add(gname);
+      made.push({
+        ...newGroup(groups.length + made.length + 1),
+        // The short role name makes a tidier interface description than the
+        // full label: ";SVL" rather than ";StackWise Virtual link".
+        name: gname, role: name, description: name,
+        rangeMode: Boolean(def.range), ports: ids,
+      });
+    }
+    if (!made.length) return;
+    const allIds = made.flatMap(g => g.ports);
+    setGroups(prev => [...prev.map(x => ({ ...x, ports: x.ports.filter(id => !allIds.includes(id)) })), ...made]);
+    setActiveId(made[0].id);
+  };
 
   // Materializes the ruleset's uplink policy as a real group, so the YAML still
   // names every port explicitly instead of depending on the policy later.
@@ -352,8 +412,9 @@ export default function Wizard({ onApply, rulesetId, onRulesetChange }) {
           <div>
             <label style={label}>VLAN {onLoopback && <span style={{ color: "#475569", fontWeight: 400 }}>(unused)</span>}</label>
             <input style={input} disabled={onLoopback} placeholder="10" value={mgmt.vlan} onChange={e => setMgmt({ ...mgmt, vlan: e.target.value })} /></div>
-          <div><label style={label}>Default gateway</label>
-            <input style={input} placeholder="192.168.1.1" value={mgmt.gw} onChange={e => setMgmt({ ...mgmt, gw: e.target.value })} /></div>
+          <div>
+            <label style={label}>Default gateway {onLoopback && <span style={{ color: "#475569", fontWeight: 400 }}>(unused)</span>}</label>
+            <input style={input} disabled={onLoopback} placeholder="192.168.1.1" value={mgmt.gw} onChange={e => setMgmt({ ...mgmt, gw: e.target.value })} /></div>
         </div>
       </div>
 
@@ -389,7 +450,30 @@ export default function Wizard({ onApply, rulesetId, onRulesetChange }) {
               ↑ Add uplinks ({proposedUplinks.length} port{proposedUplinks.length > 1 ? "s" : ""}, {uplinkPolicy.channelMode?.toLowerCase()} port-channel)
             </button>
           )}
+          {roleSets.map(rs => {
+            const picked = rolePorts(members, allPorts, rs.roles);
+            const summary = rs.roles.map(([n]) => `${(picked[n] || []).length} ${n}`).join(" + ");
+            return (
+              <button key={rs.toggle.key} onClick={() => addRoleGroups(rs)}
+                style={{ ...ghostBtn, borderStyle: "solid", borderColor: "#facc15", color: "#facc15" }}
+                title={rs.roles.map(([n, d]) => `${d.label || n}: ${(picked[n] || []).map(p => p.name).join(", ")}`).join("\n")}>
+                ⇄ Add {rs.toggle.label} ports ({summary})
+              </button>
+            );
+          })}
         </div>
+        {roleSets.map(rs => {
+          const picked = rolePorts(members, allPorts, rs.roles);
+          return (
+            <div key={rs.toggle.key} style={{ fontSize: 11, color: "#64748b", marginTop: -6, marginBottom: 12 }}>
+              {rs.roles.map(([n, d]) => (
+                <div key={n}>
+                  {d.label || n} → <span style={{ color: "#94a3b8" }}>{(picked[n] || []).map(p => p.name).join(", ") || "no free ports"}</span>
+                </div>
+              ))}
+            </div>
+          );
+        })}
         {uplinkPolicy && proposedUplinks.length > 0 && (
           <div style={{ fontSize: 11, color: "#64748b", marginTop: -6, marginBottom: 12 }}>
             {isStack ? `${uplinkPolicy.perMember ?? 1} per member` : `${uplinkPolicy.standaloneCount ?? 2} on a standalone switch`}
@@ -432,18 +516,29 @@ export default function Wizard({ onApply, rulesetId, onRulesetChange }) {
         {/* Active group settings */}
         {active && (
           <div style={{ border: `1px solid ${colorOf(active)}`, borderRadius: 8, padding: 14, background: "#0d1117" }}>
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12, marginBottom: 12 }}>
+            <div style={{ display: "grid", gridTemplateColumns: active.role ? "1fr 2fr" : "1fr 1fr 1fr", gap: 12, marginBottom: 12 }}>
               <div><label style={label}>Group name</label>
                 <input style={input} value={active.name} onChange={e => patch(active.id, { name: e.target.value })} /></div>
-              <div><label style={label}>Mode</label>
-                <select style={input} value={active.mode} onChange={e => patch(active.id, { mode: e.target.value })}>
-                  <option>Access</option><option>Trunk</option>
-                </select></div>
-              <div>
-                <label style={label}>VLAN {active.mode === "Trunk" && <span style={{ color: "#475569", fontWeight: 400 }}>(n/a on trunk)</span>}</label>
-                <input style={input} disabled={active.mode === "Trunk"} placeholder="10" value={active.vlan}
-                  onChange={e => patch(active.id, { vlan: e.target.value })} />
-              </div>
+              {active.role ? (
+                <div>
+                  <label style={label}>Role</label>
+                  <div style={{ ...input, display: "flex", alignItems: "center", color: "#facc15" }}>
+                    {rulesetPortRoles(rulesetId)[active.role]?.label || active.role} — commands come from the ruleset
+                  </div>
+                </div>
+              ) : (
+                <>
+                  <div><label style={label}>Mode</label>
+                    <select style={input} value={active.mode} onChange={e => patch(active.id, { mode: e.target.value })}>
+                      <option>Access</option><option>Trunk</option>
+                    </select></div>
+                  <div>
+                    <label style={label}>VLAN {active.mode === "Trunk" && <span style={{ color: "#475569", fontWeight: 400 }}>(n/a on trunk)</span>}</label>
+                    <input style={input} disabled={active.mode === "Trunk"} placeholder="10" value={active.vlan}
+                      onChange={e => patch(active.id, { vlan: e.target.value })} />
+                  </div>
+                </>
+              )}
             </div>
             <div style={{ marginBottom: 12 }}>
               <label style={label}>Description</label>
@@ -458,12 +553,19 @@ export default function Wizard({ onApply, rulesetId, onRulesetChange }) {
               )}
             </div>
             <div style={{ display: "flex", flexWrap: "wrap", gap: 18, alignItems: "center", fontSize: 13, color: "#cbd5e1" }}>
-              {[["dot1x", "Dot1x"], ["shutdown", "Shutdown"], ["portChannel", "Port-channel"], ["rangeMode", "Single interface range"]].map(([k, lbl]) => (
+              {(active.role
+                  ? [["rangeMode", "Single interface range"]]
+                  : [["dot1x", "Dot1x"], ["shutdown", "Shutdown"], ["portChannel", "Port-channel"], ["rangeMode", "Single interface range"]]
+                ).map(([k, lbl]) => (
                 <label key={k} style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
-                  <input type="checkbox" checked={active[k]} onChange={e => patch(active.id, { [k]: e.target.checked })} /> {lbl}
+                  <input type="checkbox" checked={active[k]} onChange={e => patch(active.id,
+                    // Ticking Port-channel pre-fills the mode this ruleset prefers.
+                    k === "portChannel" && e.target.checked
+                      ? { portChannel: true, channelMode: portDefaults.channelMode || active.channelMode }
+                      : { [k]: e.target.checked })} /> {lbl}
                 </label>
               ))}
-              {active.portChannel && (
+              {!active.role && active.portChannel && (
                 <>
                   <span style={{ display: "flex", alignItems: "center", gap: 6 }}>Group
                     <input style={{ ...input, width: 60 }} value={active.channelGroup}

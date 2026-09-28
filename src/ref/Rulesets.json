@@ -6,9 +6,18 @@
     "access-switch": {
       "name": "Access Switch",
       "description": "802.1X on by default, ';' descriptions with ZB on unsecured ports, and uplinks bundled into a desirable port-channel.",
-      "portDefaults": { "dot1x": true },
-      "naming": { "prefix": ";", "uplinkPrefix": "U;", "noDot1xSuffix": "ZB" },
-      "management": { "interface": "vlan" },
+      "portDefaults": {
+        "dot1x": true,
+        "channelMode": "Desirable"
+      },
+      "naming": {
+        "prefix": ";",
+        "uplinkPrefix": "U;",
+        "noDot1xSuffix": "ZB"
+      },
+      "management": {
+        "interface": "vlan"
+      },
       "uplinks": {
         "standaloneCount": 2,
         "perMember": 1,
@@ -22,24 +31,42 @@
           "dot1x pae authenticator",
           "spanning-tree portfast"
         ],
-        "access": ["switchport mode access"],
-        "trunk": ["switchport mode trunk"],
-        "portchannel": ["channel-group {cgNum} mode {cgMode}"],
-        "shutdownTrue": ["shutdown"],
-        "shutdownFalse": ["no shutdown"]
+        "access": [
+          "switchport mode access"
+        ],
+        "trunk": [
+          "switchport mode trunk"
+        ],
+        "portchannel": [
+          "channel-group {cgNum} mode {cgMode}"
+        ],
+        "shutdownTrue": [
+          "shutdown"
+        ],
+        "shutdownFalse": [
+          "no shutdown"
+        ]
       }
     },
     "distribution-switch": {
       "name": "Distribution Switch",
       "description": "Routed distribution layer: management addressed on Loopback0, no 802.1X, optional StackWise Virtual.",
-      "portDefaults": { "dot1x": false },
-      "naming": { "prefix": ";", "uplinkPrefix": "U;" },
-      "management": { "interface": "loopback", "number": 0 },
+      "portDefaults": {
+        "dot1x": false,
+        "channelMode": "Desirable"
+      },
+      "naming": {
+        "prefix": ";"
+      },
+      "management": {
+        "interface": "loopback",
+        "number": 0
+      },
       "deviceToggles": [
         {
           "key": "StackWiseVirtual",
           "label": "StackWise Virtual",
-          "hint": "Emits the global StackWise Virtual block. Assign the SVL links on the member interfaces themselves.",
+          "hint": "Emits the global StackWise Virtual block and offers a button to lay out the SVL and dual-active detection ports.",
           "commands": [
             "stackwise-virtual",
             " domain 1"
@@ -48,11 +75,46 @@
       ],
       "commands": {
         "dot1x": [],
-        "access": ["switchport mode access"],
-        "trunk": ["switchport mode trunk"],
-        "portchannel": ["channel-group {cgNum} mode {cgMode}"],
-        "shutdownTrue": ["shutdown"],
-        "shutdownFalse": ["no shutdown"]
+        "access": [
+          "switchport mode access"
+        ],
+        "trunk": [
+          "switchport mode trunk"
+        ],
+        "portchannel": [
+          "channel-group {cgNum} mode {cgMode}"
+        ],
+        "shutdownTrue": [
+          "shutdown"
+        ],
+        "shutdownFalse": [
+          "no shutdown"
+        ]
+      },
+      "portRoles": {
+        "SVL": {
+          "label": "StackWise Virtual link",
+          "requiresToggle": "StackWiseVirtual",
+          "select": {
+            "perMember": 2,
+            "from": "onboard"
+          },
+          "range": true,
+          "commands": [
+            "stackwise-virtual link 1"
+          ]
+        },
+        "DAD": {
+          "label": "Dual-active detection (fast hello)",
+          "requiresToggle": "StackWiseVirtual",
+          "select": {
+            "perMember": 1,
+            "from": "onboard"
+          },
+          "commands": [
+            "stackwise-virtual dual-active-detection"
+          ]
+        }
       }
     }
   }
