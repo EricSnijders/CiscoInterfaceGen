@@ -8,6 +8,7 @@ import {
   RULESET_IDS, RULESET_OPTIONS, DEFAULT_RULESET_ID, isKnownRuleset,
   rulesetCommands, rulesetName, rulesetSummary, rulesetRuleCount,
   rulesetRules, matchesRule, toRulesetJSON, rulesetNaming, formatDescription,
+  rulesetPortDefaults, rulesetUplinks,
 } from "./ref/rulesets";
 
 // ── Default command sets ───────────────────────────────────────────────────
@@ -23,8 +24,10 @@ const DEFAULTS_META = [
 
 // ── YAML schema: known keys per context ───────────────────────────────────
 const TOP_LEVEL_RESERVED = ["Devices", "Modules", "Management", "Ruleset"];
-const PORT_GROUP_KEYS = ["Interfaces","Mode","VLAN","Dot1x","Shutdown","Description","UplinkModule","PortChannel","ChannelGroup","ChannelMode"];
-const BOOL_KEYS = new Set(["Dot1x","Shutdown","UplinkModule","PortChannel"]);
+const PORT_GROUP_KEYS = ["Interfaces","Mode","VLAN","Dot1x","Shutdown","Description","UplinkModule","PortChannel","ChannelGroup","ChannelMode","Range"];
+const BOOL_KEYS = new Set(["Dot1x","Shutdown","UplinkModule","PortChannel","Range"]);
+// IOS accepts at most five comma-separated ranges per "interface range".
+const MAX_RANGES_PER_COMMAND = 5;
 const MODE_VALUES = ["Access","Trunk"];
 const MGMT_KEYS = ["IP","VLAN","DefaultGW"];
 
@@ -184,6 +187,7 @@ function getCompletions(model, position) {
         ["PortChannel", "PortChannel: True"],
         ["ChannelGroup", "ChannelGroup: 1"],
         ["ChannelMode", "ChannelMode: Active"],
+        ["Range", "Range: True"],
       ];
       for (const [k, v] of snippets)
         suggestions.push({ label: k, kind: 14, insertText: v, range, detail: "Port group field" });
@@ -346,6 +350,7 @@ function generateConfig(yaml, excelMaps, { rules, label, naming }) {
     const cgMode = (grp.ChannelMode || "active").toLowerCase();
     const dot1x = ["true","yes"].includes((grp.Dot1x||"").toLowerCase());
     const shutdown = ["true","yes"].includes((grp.Shutdown||"").toLowerCase());
+    const rangeMode = ["true","yes"].includes((grp.Range||"").toLowerCase());
     const desc = grp.Description || groupName;
     const vlan = grp.VLAN || grp.Vlan || null;
 
@@ -377,15 +382,32 @@ function generateConfig(yaml, excelMaps, { rules, label, naming }) {
       return { ...groupFacts, interface: "physical", member, portType, model: memberModelMap[member] };
     };
 
+    // Resolve every token to its printable form, keeping the shorthand so the
+    // facts for a block can be read off its first interface.
+    const entries = [];
     for (const token of tokens) {
       if (token.type === "range") {
         const { rangeStr, error } = resolveIfaceRange(token, memberModelMap, excelMaps);
         if (error) { lines.push(rangeStr); continue; }
-        lines.push(`interface range ${rangeStr}`);
-        emitCommands(factsFor(token.sh1));
+        entries.push({ text: rangeStr, sh: token.sh1, isRange: true });
       } else {
-        lines.push(`interface ${resolveIface(token.sh, memberModelMap, excelMaps)}`);
-        emitCommands(factsFor(token.sh));
+        const name = resolveIface(token.sh, memberModelMap, excelMaps);
+        if (name.startsWith("! ")) { lines.push(name); continue; }
+        entries.push({ text: name, sh: token.sh, isRange: false });
+      }
+    }
+
+    if (rangeMode) {
+      // One "interface range" for the whole group, chunked to what IOS accepts.
+      for (let i = 0; i < entries.length; i += MAX_RANGES_PER_COMMAND) {
+        const chunk = entries.slice(i, i + MAX_RANGES_PER_COMMAND);
+        lines.push(`interface range ${chunk.map(e => e.text).join(", ")}`);
+        emitCommands(factsFor(chunk[0].sh));
+      }
+    } else {
+      for (const e of entries) {
+        lines.push(e.isRange ? `interface range ${e.text}` : `interface ${e.text}`);
+        emitCommands(factsFor(e.sh));
       }
     }
 
@@ -445,6 +467,26 @@ function DefaultsModal({ defaults, rulesetId, onSave, onClose }) {
   );
   const [activeKey, setActiveKey] = useState(DEFAULTS_META[0].key);
   const activeMeta = DEFAULTS_META.find(m => m.key === activeKey);
+
+  // The command buckets are editable here; the policy sections are not, because
+  // they change what the wizard does and belong in review. Showing them anyway
+  // beats leaving people to discover them by reading Rulesets.json.
+  const naming = rulesetNaming(rulesetId);
+  const portDefaults = rulesetPortDefaults(rulesetId);
+  const uplinks = rulesetUplinks(rulesetId);
+  const policyRows = [
+    ...(Object.keys(portDefaults).length
+      ? [["New port groups start with", Object.entries(portDefaults).map(([k, v]) => `${k} ${v ? "on" : "off"}`).join(", ")]] : []),
+    ...(naming.prefix ? [["Description prefix", `"${naming.prefix}"`]] : []),
+    ...(naming.noDot1xSuffix ? [["Appended without dot1x", `"${naming.noDot1xSuffix}" (access ports only)`]] : []),
+    ...(uplinks ? [
+      ["Uplinks, standalone", `${uplinks.standaloneCount ?? 2} port(s)`],
+      ["Uplinks, per stack member", `${uplinks.perMember ?? 1} port(s)`],
+      ["Uplink ports taken from", uplinks.prefer === "module" ? "the network module, else onboard" : "onboard ports"],
+      ["Uplink port-channel", `group ${uplinks.channelGroup ?? 1}, ${uplinks.channelMode || "Active"} mode`],
+    ] : []),
+  ];
+  const hasPolicy = policyRows.length > 0 || rulesetRuleCount(rulesetId) > 0;
   const handleSave = () => {
     onSave(Object.fromEntries(Object.entries(local).map(([k, v]) => [k, v.split("\n").map(s => s.trim()).filter(Boolean)])));
     onClose();
@@ -473,29 +515,67 @@ function DefaultsModal({ defaults, rulesetId, onSave, onClose }) {
                 {m.label}
               </button>
             ))}
+            {hasPolicy && (
+              <button onClick={() => setActiveKey("__policy")}
+                style={{ display: "block", width: "100%", textAlign: "left", padding: "9px 16px", border: "none", cursor: "pointer", marginTop: 6, borderTop: "1px solid #334155", background: activeKey === "__policy" ? "#0f172a" : "none", color: activeKey === "__policy" ? "#e2e8f0" : "#94a3b8", fontSize: 13, fontWeight: activeKey === "__policy" ? 600 : 400, borderLeft: activeKey === "__policy" ? "3px solid #facc15" : "3px solid transparent" }}>
+                Policy <span style={{ color: "#64748b", fontSize: 11 }}>read-only</span>
+              </button>
+            )}
           </div>
           <div style={{ flex: 1, padding: 20, display: "flex", flexDirection: "column", gap: 10, overflow: "auto" }}>
-            <div>
-              <div style={{ fontWeight: 600, fontSize: 14, color: "#e2e8f0", marginBottom: 4 }}>{activeMeta.label}</div>
-              <div style={{ fontSize: 12, color: "#64748b" }}>{activeMeta.hint}</div>
-            </div>
-            <textarea value={local[activeKey]} onChange={e => setLocal(prev => ({ ...prev, [activeKey]: e.target.value }))} spellCheck={false}
-              style={{ fontFamily: "monospace", fontSize: 13, lineHeight: 1.7, background: "#0d1117", color: "#a3e635", border: "1px solid #334155", borderRadius: 8, padding: 14, flex: 1, minHeight: 180, resize: "vertical", outline: "none", width: "100%", boxSizing: "border-box" }} />
-            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-              <button onClick={() => setLocal(prev => ({ ...prev, [activeKey]: rulesetCommands(rulesetId)[activeKey].join("\n") }))}
-                style={{ padding: "5px 12px", borderRadius: 6, background: "none", border: "1px solid #475569", color: "#64748b", cursor: "pointer", fontSize: 12 }}>
-                ↺ Reset this section
-              </button>
-              {/* Makes an in-session tweak reviewable: paste into Rulesets.json, open a PR. */}
-              <button onClick={() => {
-                const commands = Object.fromEntries(Object.entries(local).map(([k, v]) => [k, v.split("\n").map(s => s.trim()).filter(Boolean)]));
-                navigator.clipboard?.writeText(toRulesetJSON(rulesetId, commands));
-                setCopied(true); setTimeout(() => setCopied(false), 2000);
-              }}
-                style={{ padding: "5px 12px", borderRadius: 6, background: "none", border: "1px solid #475569", color: copied ? "#a3e635" : "#64748b", cursor: "pointer", fontSize: 12 }}>
-                {copied ? "✓ Copied" : "⧉ Copy JSON for Rulesets.json"}
-              </button>
-            </div>
+            {activeKey === "__policy" ? (
+              <>
+                <div>
+                  <div style={{ fontWeight: 600, fontSize: 14, color: "#e2e8f0", marginBottom: 4 }}>Policy</div>
+                  <div style={{ fontSize: 12, color: "#64748b" }}>
+                    What this ruleset does beyond the command buckets. Change these in Rulesets.json, where CI checks them.
+                  </div>
+                </div>
+                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12.5 }}>
+                  <tbody>
+                    {policyRows.map(([k, v]) => (
+                      <tr key={k} style={{ borderBottom: "1px solid #1e293b" }}>
+                        <td style={{ padding: "7px 12px 7px 0", color: "#94a3b8", whiteSpace: "nowrap" }}>{k}</td>
+                        <td style={{ padding: "7px 0", color: "#e2e8f0" }}>{v}</td>
+                      </tr>
+                    ))}
+                    {rulesetRuleCount(rulesetId) > 0 && (
+                      <tr style={{ borderBottom: "1px solid #1e293b" }}>
+                        <td style={{ padding: "7px 12px 7px 0", color: "#94a3b8", whiteSpace: "nowrap" }}>Condition rules</td>
+                        <td style={{ padding: "7px 0", color: "#e2e8f0" }}>{rulesetRuleCount(rulesetId)}, applied after the buckets above</td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+                {!policyRows.length && (
+                  <div style={{ fontSize: 12, color: "#64748b" }}>This ruleset defines no naming, port defaults or uplink policy.</div>
+                )}
+              </>
+            ) : (
+              <>
+                <div>
+                  <div style={{ fontWeight: 600, fontSize: 14, color: "#e2e8f0", marginBottom: 4 }}>{activeMeta.label}</div>
+                  <div style={{ fontSize: 12, color: "#64748b" }}>{activeMeta.hint}</div>
+                </div>
+                <textarea value={local[activeKey]} onChange={e => setLocal(prev => ({ ...prev, [activeKey]: e.target.value }))} spellCheck={false}
+                  style={{ fontFamily: "monospace", fontSize: 13, lineHeight: 1.7, background: "#0d1117", color: "#a3e635", border: "1px solid #334155", borderRadius: 8, padding: 14, flex: 1, minHeight: 180, resize: "vertical", outline: "none", width: "100%", boxSizing: "border-box" }} />
+                <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                  <button onClick={() => setLocal(prev => ({ ...prev, [activeKey]: rulesetCommands(rulesetId)[activeKey].join("\n") }))}
+                    style={{ padding: "5px 12px", borderRadius: 6, background: "none", border: "1px solid #475569", color: "#64748b", cursor: "pointer", fontSize: 12 }}>
+                    ↺ Reset this section
+                  </button>
+                  {/* Makes an in-session tweak reviewable: paste into Rulesets.json, open a PR. */}
+                  <button onClick={() => {
+                    const commands = Object.fromEntries(Object.entries(local).map(([k, v]) => [k, v.split("\n").map(s => s.trim()).filter(Boolean)]));
+                    navigator.clipboard?.writeText(toRulesetJSON(rulesetId, commands));
+                    setCopied(true); setTimeout(() => setCopied(false), 2000);
+                  }}
+                    style={{ padding: "5px 12px", borderRadius: 6, background: "none", border: "1px solid #475569", color: copied ? "#a3e635" : "#64748b", cursor: "pointer", fontSize: 12 }}>
+                    {copied ? "✓ Copied" : "⧉ Copy JSON for Rulesets.json"}
+                  </button>
+                </div>
+              </>
+            )}
           </div>
         </div>
         <div style={{ padding: "14px 20px", borderTop: "1px solid #334155", display: "flex", justifyContent: "flex-end", gap: 10 }}>

@@ -12,7 +12,7 @@ const newMember = () => ({ id: uid(), model: SWITCH_MODELS[0], module: "" });
 const newGroup  = (n, defaults = {}) => ({
   id: uid(), name: `Group${n}`, mode: "Access", vlan: "",
   dot1x: Boolean(defaults.dot1x), shutdown: Boolean(defaults.shutdown),
-  description: "", portChannel: false,
+  description: "", portChannel: false, rangeMode: false,
   channelGroup: "1", channelMode: "Active", ports: [],
 });
 
@@ -106,6 +106,7 @@ function buildYAML({ members, ruleset, mgmt, groups, portsById }) {
     L.push(`  Shutdown: ${g.shutdown ? "True" : "False"}`);
     if (g.portChannel)
       L.push(`  PortChannel: True`, `  ChannelGroup: ${g.channelGroup}`, `  ChannelMode: ${g.channelMode}`);
+    if (g.rangeMode) L.push(`  Range: True`);
     L.push(`  Description: "${(g.description || g.name).replace(/"/g, "'")}"`);
   }
   return L.join("\n") + "\n";
@@ -121,6 +122,7 @@ const input = { background: "#0d1117", border: "1px solid #334155", borderRadius
 const stepTitle = { fontSize: 13, fontWeight: 700, color: "#e2e8f0", marginBottom: 12, display: "flex", alignItems: "center", gap: 8 };
 const badge = { background: "#3b82f6", color: "#fff", borderRadius: "50%", width: 20, height: 20, display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 700, flexShrink: 0 };
 const ghostBtn = { padding: "6px 12px", borderRadius: 7, cursor: "pointer", fontSize: 12, background: "none", border: "1px dashed #475569", color: "#64748b" };
+const memberGrid = { display: "grid", gridTemplateColumns: `42px 1fr 1fr ${CONTROL_H}px`, gap: 10 };
 
 export default function Wizard({ onApply, rulesetId, onRulesetChange }) {
   const [members, setMembers]   = useState(() => [newMember()]);
@@ -258,42 +260,39 @@ export default function Wizard({ onApply, rulesetId, onRulesetChange }) {
           </span>
         </div>
 
-        {/* Top-aligned: every cell leads with a label of the same height, so the
-            controls line up even though only some cells carry a hint below. */}
+        {/* Column headers once, then one row per member — it is a table, so the
+            labels do not repeat. Port counts live in hover tooltips to keep
+            a tall stack readable. The trailing spacer matches the button
+            column's width so header and rows resolve identical 1fr columns. */}
+        <div style={{ ...memberGrid, marginBottom: 6 }}>
+          <label style={{ ...label, margin: 0 }}>Mbr</label>
+          <label style={{ ...label, margin: 0 }}>Switch model</label>
+          <label style={{ ...label, margin: 0 }}>Network module <span style={{ color: "#475569", fontWeight: 400 }}>(optional)</span></label>
+          <span style={{ width: CONTROL_H }} />
+        </div>
+
         {members.map((m, i) => (
-          <div key={m.id} style={{ display: "grid", gridTemplateColumns: "42px 1fr 1fr auto", gap: 10, alignItems: "start", marginBottom: 10 }}>
-            <div>
-              <label style={label}>Mbr</label>
-              <div style={{ ...input, fontWeight: 700, color: "#3b82f6", display: "flex", alignItems: "center", justifyContent: "center", padding: 0 }}>{i + 1}</div>
+          <div key={m.id} style={{ ...memberGrid, alignItems: "center", marginBottom: 8 }}>
+            <div style={{ ...input, fontWeight: 700, color: "#3b82f6", display: "flex", alignItems: "center", justifyContent: "center", padding: 0 }}>
+              {i + 1}
             </div>
-            <div>
-              <label style={label}>Switch model</label>
-              <select value={m.model} onChange={e => patchMember(m.id, { model: e.target.value, module: "" })} style={input}>
-                {SWITCH_MODELS.map(x => <option key={x} value={x}>{x}</option>)}
-              </select>
-              <div style={{ fontSize: 11, color: "#64748b", marginTop: 4 }}>{switchSummary(m.model)}</div>
-            </div>
-            <div>
-              <label style={label}>Network module <span style={{ color: "#475569", fontWeight: 400 }}>(optional)</span></label>
-              <select value={m.module} onChange={e => patchMember(m.id, { module: e.target.value })} style={input}>
-                <option value="">— none —</option>
-                {modulesFor(m.model).map(x => <option key={x} value={x}>{x}</option>)}
-              </select>
-              <div style={{ fontSize: 11, color: "#64748b", marginTop: 4 }}>
-                {m.module ? `${moduleSummary(m.module)} — slot ${i + 1}/${MODULE_SLOT}` : "No uplink module"}
-              </div>
-            </div>
-            <div>
-              {/* Keeps this cell's control on the same baseline as the others. */}
-              <label style={{ ...label, visibility: "hidden" }}>&nbsp;</label>
-              <button onClick={() => setMembers(members.filter(x => x.id !== m.id))} disabled={members.length === 1}
-                title={members.length === 1 ? "A switch needs at least one member" : "Remove this member"}
-                style={{ width: CONTROL_H, height: CONTROL_H, boxSizing: "border-box", padding: 0, borderRadius: 6, background: "none",
-                  cursor: members.length === 1 ? "not-allowed" : "pointer", fontSize: 13,
-                  border: `1px solid ${members.length === 1 ? "#334155" : "#7f1d1d"}`, color: members.length === 1 ? "#334155" : "#f87171" }}>
-                ✕
-              </button>
-            </div>
+            <select value={m.model} onChange={e => patchMember(m.id, { model: e.target.value, module: "" })}
+              title={`${m.model} — ${switchSummary(m.model)}`} style={input}>
+              {SWITCH_MODELS.map(x => <option key={x} value={x}>{x}</option>)}
+            </select>
+            <select value={m.module} onChange={e => patchMember(m.id, { module: e.target.value })}
+              title={m.module ? `${m.module} — ${moduleSummary(m.module)}, slot ${i + 1}/${MODULE_SLOT}` : "No uplink module"}
+              style={input}>
+              <option value="">— none —</option>
+              {modulesFor(m.model).map(x => <option key={x} value={x}>{x}</option>)}
+            </select>
+            <button onClick={() => setMembers(members.filter(x => x.id !== m.id))} disabled={members.length === 1}
+              title={members.length === 1 ? "A switch needs at least one member" : "Remove this member"}
+              style={{ width: CONTROL_H, height: CONTROL_H, boxSizing: "border-box", padding: 0, borderRadius: 6, background: "none",
+                cursor: members.length === 1 ? "not-allowed" : "pointer", fontSize: 13,
+                border: `1px solid ${members.length === 1 ? "#334155" : "#7f1d1d"}`, color: members.length === 1 ? "#334155" : "#f87171" }}>
+              ✕
+            </button>
           </div>
         ))}
 
@@ -431,7 +430,7 @@ export default function Wizard({ onApply, rulesetId, onRulesetChange }) {
               )}
             </div>
             <div style={{ display: "flex", flexWrap: "wrap", gap: 18, alignItems: "center", fontSize: 13, color: "#cbd5e1" }}>
-              {[["dot1x", "Dot1x"], ["shutdown", "Shutdown"], ["portChannel", "Port-channel"]].map(([k, lbl]) => (
+              {[["dot1x", "Dot1x"], ["shutdown", "Shutdown"], ["portChannel", "Port-channel"], ["rangeMode", "Single interface range"]].map(([k, lbl]) => (
                 <label key={k} style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
                   <input type="checkbox" checked={active[k]} onChange={e => patch(active.id, { [k]: e.target.checked })} /> {lbl}
                 </label>
