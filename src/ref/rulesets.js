@@ -82,17 +82,32 @@ export function matchesRule(when, facts) {
 export const rulesetNaming       = id => RS.rulesets[id]?.naming || {};
 export const rulesetPortDefaults = id => RS.rulesets[id]?.portDefaults || {};
 export const rulesetUplinks      = id => RS.rulesets[id]?.uplinks || null;
+export const rulesetManagement   = id => RS.rulesets[id]?.management || {};
+export const rulesetDeviceToggles= id => RS.rulesets[id]?.deviceToggles || [];
 
-// A group's Description as it should appear on the interface. The prefix and
-// suffix are idempotent, so a description typed as ";PRINTER" is not turned
-// into ";;PRINTER".
+// Every device-toggle key any ruleset defines. The YAML validator needs the
+// union, since a file may name a toggle belonging to a different ruleset.
+export const ALL_DEVICE_TOGGLE_KEYS = [...new Set(
+  Object.values(RS.rulesets || {}).flatMap(r => (r.deviceToggles || []).map(t => t.key)).filter(Boolean)
+)];
+
+// A group's Description as it should appear on the interface. Trunks take
+// uplinkPrefix, everything else takes prefix. Any convention prefix already
+// present is stripped first, so flipping a group between access and trunk
+// re-labels it rather than stacking ";" and "U;".
 export function formatDescription(desc, { mode, dot1x }, naming = {}) {
-  const { prefix = "", noDot1xSuffix = "" } = naming;
+  const { prefix = "", uplinkPrefix = "", noDot1xSuffix = "" } = naming;
+  const isTrunk = String(mode).toLowerCase() === "trunk";
+  const wanted = isTrunk && uplinkPrefix ? uplinkPrefix : prefix;
+
   let out = String(desc ?? "");
-  if (prefix && !out.startsWith(prefix)) out = prefix + out;
+  for (const p of [uplinkPrefix, prefix].filter(Boolean).sort((a, b) => b.length - a.length))
+    if (out.startsWith(p)) { out = out.slice(p.length); break; }
+  if (wanted) out = wanted + out;
+
   // ZB marks an access port deliberately left without 802.1X. A trunk was
   // never a candidate for dot1x, so it is not marked.
-  const unsecured = String(mode).toLowerCase() === "access" && !dot1x;
+  const unsecured = !isTrunk && !dot1x;
   if (noDot1xSuffix && unsecured && !out.endsWith(noDot1xSuffix)) out = `${out} ${noDot1xSuffix}`;
   return out;
 }

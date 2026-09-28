@@ -12,6 +12,7 @@ import { dirname, join } from "node:path";
 import {
   COMMAND_KEYS, RULE_FACTS, FACT_VALUES, BOOLEAN_FACTS,
   NAMING_KEYS, PORT_DEFAULT_KEYS, UPLINK_KEYS, UPLINK_PREFER, CHANNEL_MODE_VALUES,
+  MANAGEMENT_KEYS, MANAGEMENT_INTERFACES, DEVICE_TOGGLE_KEYS,
 } from "../src/ref/schema.js";
 
 const REF = join(dirname(fileURLToPath(import.meta.url)), "..", "src", "ref");
@@ -135,6 +136,41 @@ function checkSections(file, id, def) {
         if (PORT_DEFAULT_KEYS.includes(k) && typeof v !== "boolean")
           fail(file, `${id}.portDefaults.${k}: must be true or false`);
     }
+  }
+
+  const mg = def.management;
+  if (mg !== undefined) {
+    if (typeof mg !== "object" || mg === null || Array.isArray(mg))
+      fail(file, `${id}.management: must be an object`);
+    else {
+      unknown("management", mg, MANAGEMENT_KEYS);
+      if (mg.interface !== undefined && !MANAGEMENT_INTERFACES.includes(String(mg.interface).toLowerCase()))
+        fail(file, `${id}.management.interface: must be one of ${MANAGEMENT_INTERFACES.join(", ")}`);
+      if (mg.number !== undefined && (!Number.isInteger(mg.number) || mg.number < 0))
+        fail(file, `${id}.management.number: must be a whole number of 0 or more`);
+    }
+  }
+
+  const toggles = def.deviceToggles;
+  if (toggles !== undefined) {
+    if (!Array.isArray(toggles)) fail(file, `${id}.deviceToggles: must be an array`);
+    else toggles.forEach((t, i) => {
+      const at = `${id}.deviceToggles[${i}]`;
+      if (typeof t !== "object" || t === null || Array.isArray(t))
+        return fail(file, `${at}: must be an object`);
+      unknown(`deviceToggles[${i}]`, t, DEVICE_TOGGLE_KEYS);
+      // The key becomes a top-level YAML key, so it must look like one.
+      if (typeof t.key !== "string" || !/^[A-Za-z][A-Za-z0-9]*$/.test(t.key))
+        fail(file, `${at}.key: must be a letters-and-digits name, e.g. StackWiseVirtual`);
+      if (t.label !== undefined && typeof t.label !== "string")
+        fail(file, `${at}.label: must be a string`);
+      if (t.hint !== undefined && typeof t.hint !== "string")
+        fail(file, `${at}.hint: must be a string`);
+      if (!Array.isArray(t.commands) || !t.commands.every(c => typeof c === "string"))
+        fail(file, `${at}.commands: must be an array of command strings`);
+      else if (!t.commands.length)
+        fail(file, `${at}.commands: is empty, so the toggle does nothing`);
+    });
   }
 
   const up = def.uplinks;

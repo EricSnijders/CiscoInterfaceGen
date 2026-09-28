@@ -34,7 +34,18 @@ export const CHANNEL_MODE_VALUES = ["Active", "Passive", "On", "Auto", "Desirabl
 // pre-fill, how a description is written, and which ports become uplinks.
 
 // naming: how a group's Description becomes the emitted `description` line.
-export const NAMING_KEYS = ["prefix", "noDot1xSuffix"];
+// uplinkPrefix replaces prefix on trunk ports, so an uplink reads "U;Core".
+export const NAMING_KEYS = ["prefix", "uplinkPrefix", "noDot1xSuffix"];
+
+// management: what the Management IP becomes. An access switch addresses an
+// SVI; a routed distribution switch addresses a loopback.
+export const MANAGEMENT_KEYS = ["interface", "number"];
+export const MANAGEMENT_INTERFACES = ["vlan", "loopback"];
+
+// deviceToggles: box-wide features, switched on per device rather than per
+// port — StackWise Virtual, for instance. Each becomes a checkbox in the
+// wizard, a top-level YAML key, and a block of global config.
+export const DEVICE_TOGGLE_KEYS = ["key", "label", "commands", "hint"];
 
 // portDefaults: initial state of a newly added port group in the wizard.
 export const PORT_DEFAULT_KEYS = ["dot1x", "shutdown"];

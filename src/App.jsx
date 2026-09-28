@@ -8,7 +8,8 @@ import {
   RULESET_IDS, RULESET_OPTIONS, DEFAULT_RULESET_ID, isKnownRuleset,
   rulesetCommands, rulesetName, rulesetSummary, rulesetRuleCount,
   rulesetRules, matchesRule, toRulesetJSON, rulesetNaming, formatDescription,
-  rulesetPortDefaults, rulesetUplinks,
+  rulesetPortDefaults, rulesetUplinks, rulesetManagement, rulesetDeviceToggles,
+  ALL_DEVICE_TOGGLE_KEYS,
 } from "./ref/rulesets";
 
 // ── Default command sets ───────────────────────────────────────────────────
@@ -23,7 +24,9 @@ const DEFAULTS_META = [
 ];
 
 // ── YAML schema: known keys per context ───────────────────────────────────
-const TOP_LEVEL_RESERVED = ["Devices", "Modules", "Management", "Ruleset"];
+// Device-toggle keys are reserved too, so a file naming one is not mistaken
+// for a port group.
+const TOP_LEVEL_RESERVED = ["Devices", "Modules", "Management", "Ruleset", ...ALL_DEVICE_TOGGLE_KEYS];
 const PORT_GROUP_KEYS = ["Interfaces","Mode","VLAN","Dot1x","Shutdown","Description","UplinkModule","PortChannel","ChannelGroup","ChannelMode","Range"];
 const BOOL_KEYS = new Set(["Dot1x","Shutdown","UplinkModule","PortChannel","Range"]);
 // IOS accepts at most five comma-separated ranges per "interface range".
@@ -300,7 +303,7 @@ function applyVars(cmd, vars) {
 }
 
 // ── Config generator ───────────────────────────────────────────────────────
-function generateConfig(yaml, excelMaps, { rules, label, naming }) {
+function generateConfig(yaml, excelMaps, { rules, label, naming, management, deviceToggles }) {
   const lines = [];
   const reservedKeys = new Set(TOP_LEVEL_RESERVED);
   const portChannelsDone = new Set();
@@ -325,12 +328,34 @@ function generateConfig(yaml, excelMaps, { rules, label, naming }) {
   }
   if (yaml.Modules && Object.keys(yaml.Modules).length)
     for (const [slot, model] of Object.entries(yaml.Modules)) lines.push(`! Module ${slot}: ${model}`);
-  if (mgmtVlan) lines.push(`! Management VLAN: ${mgmtVlan}${mgmtIPRaw ? `  IP: ${mgmtIPRaw}` : ""}${mgmtGW ? `  GW: ${mgmtGW}` : ""}`);
+  const onLoopback = String(management?.interface || "vlan").toLowerCase() === "loopback";
+  const loopbackNum = management?.number ?? 0;
+  if (onLoopback && mgmtIPRaw) lines.push(`! Management: Loopback${loopbackNum}  IP: ${mgmtIPRaw}`);
+  else if (mgmtVlan) lines.push(`! Management VLAN: ${mgmtVlan}${mgmtIPRaw ? `  IP: ${mgmtIPRaw}` : ""}${mgmtGW ? `  GW: ${mgmtGW}` : ""}`);
   if (label) lines.push(`! Ruleset: ${label}`);
+  const activeToggles = (deviceToggles || [])
+    .filter(t => ["true", "yes"].includes(String(yaml[t.key] ?? "").toLowerCase()));
+  for (const t of activeToggles) lines.push(`! ${t.label || t.key}: enabled`);
   lines.push(`! ================================================`);
   lines.push(`!`);
+
+  // Box-wide features first: global config belongs above the interfaces.
+  for (const t of activeToggles) {
+    for (const cmd of t.commands || []) lines.push(cmd);
+    lines.push(`!`);
+  }
+
   if (mgmtGW) { lines.push(`ip default-gateway ${mgmtGW}`); lines.push(`!`); }
-  if (mgmtVlan) {
+  if (onLoopback) {
+    // A routed switch addresses itself on a loopback rather than an SVI.
+    if (mgmtIPRaw) {
+      lines.push(`interface Loopback${loopbackNum}`);
+      lines.push(` description Management`);
+      if (mgmtIP) lines.push(` ip address ${mgmtIP.ip} ${mgmtIP.mask}`);
+      else lines.push(` ! WARNING: Management IP is not valid CIDR`);
+      lines.push(`!`);
+    }
+  } else if (mgmtVlan) {
     lines.push(`interface Vlan${mgmtVlan}`);
     lines.push(` description Management`);
     if (mgmtIP) lines.push(` ip address ${mgmtIP.ip} ${mgmtIP.mask}`);
@@ -695,6 +720,8 @@ export default function App() {
         rules: rulesetRules(rsId, commands),
         label: rulesetName(rsId),
         naming: rulesetNaming(rsId),
+        management: rulesetManagement(rsId),
+        deviceToggles: rulesetDeviceToggles(rsId),
       }));
     } catch (e) { setError(e.message); setConfig(""); }
   };

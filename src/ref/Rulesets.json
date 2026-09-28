@@ -1,41 +1,14 @@
 {
   "schemaVersion": 1,
-  "description": "Named command rulesets. Each ruleset supplies the IOS commands emitted per condition. Edit these in git so a whole team generates identical config; {cgNum} and {cgMode} are substituted from the port group's ChannelGroup / ChannelMode.",
-  "default": "campus-access",
+  "description": "Named command rulesets. Each ruleset supplies the IOS commands emitted per condition, plus the policy the wizard follows. Edit these in git so a whole team generates identical config; {cgNum}, {cgMode} and {vlan} are substituted from the port group.",
+  "default": "access-switch",
   "rulesets": {
-    "campus-access": {
-      "name": "Campus Access",
-      "description": "Standard access layer: dot1x on user ports, portfast, LACP uplinks.",
-      "commands": {
-        "dot1x": [
-          "authentication port-control auto",
-          "dot1x pae authenticator",
-          "spanning-tree portfast"
-        ],
-        "access": ["switchport mode access"],
-        "trunk": ["switchport mode trunk"],
-        "portchannel": ["channel-group {cgNum} mode {cgMode}"],
-        "shutdownTrue": ["shutdown"],
-        "shutdownFalse": ["no shutdown"]
-      }
-    },
-    "lab-open": {
-      "name": "Lab / Open",
-      "description": "No 802.1X. Portfast on every access port so lab kit comes up immediately.",
-      "commands": {
-        "dot1x": [],
-        "access": ["switchport mode access", "spanning-tree portfast"],
-        "trunk": ["switchport mode trunk"],
-        "portchannel": ["channel-group {cgNum} mode {cgMode}"],
-        "shutdownTrue": ["shutdown"],
-        "shutdownFalse": ["no shutdown"]
-      }
-    },
     "access-switch": {
       "name": "Access Switch",
-      "description": "802.1X on by default, ';' description prefix with ZB on unsecured ports, and uplinks bundled into a desirable port-channel.",
+      "description": "802.1X on by default, ';' descriptions with ZB on unsecured ports, and uplinks bundled into a desirable port-channel.",
       "portDefaults": { "dot1x": true },
-      "naming": { "prefix": ";", "noDot1xSuffix": "ZB" },
+      "naming": { "prefix": ";", "uplinkPrefix": "U;", "noDot1xSuffix": "ZB" },
+      "management": { "interface": "vlan" },
       "uplinks": {
         "standaloneCount": 2,
         "perMember": 1,
@@ -56,43 +29,27 @@
         "shutdownFalse": ["no shutdown"]
       }
     },
-    "campus-strict": {
-      "name": "Campus Strict",
-      "description": "Campus Access, but 802.1X only on copper and storm control on copper access ports. Shows what condition rules can express.",
+    "distribution-switch": {
+      "name": "Distribution Switch",
+      "description": "Routed distribution layer: management addressed on Loopback0, no 802.1X, optional StackWise Virtual.",
+      "portDefaults": { "dot1x": false },
+      "naming": { "prefix": ";", "uplinkPrefix": "U;" },
+      "management": { "interface": "loopback", "number": 0 },
+      "deviceToggles": [
+        {
+          "key": "StackWiseVirtual",
+          "label": "StackWise Virtual",
+          "hint": "Emits the global StackWise Virtual block. Assign the SVL links on the member interfaces themselves.",
+          "commands": [
+            "stackwise-virtual",
+            " domain 1"
+          ]
+        }
+      ],
       "commands": {
         "dot1x": [],
         "access": ["switchport mode access"],
         "trunk": ["switchport mode trunk"],
-        "portchannel": ["channel-group {cgNum} mode {cgMode}"],
-        "shutdownTrue": ["shutdown"],
-        "shutdownFalse": ["no shutdown"]
-      },
-      "rules": [
-        {
-          "when": { "mode": "Access", "dot1x": true, "portType": "RJ45", "interface": "physical" },
-          "commands": [
-            "authentication port-control auto",
-            "dot1x pae authenticator",
-            "spanning-tree portfast"
-          ]
-        },
-        {
-          "when": { "mode": "Access", "portType": "RJ45", "interface": "physical" },
-          "commands": ["storm-control broadcast level 5.00"]
-        },
-        {
-          "when": { "mode": "Trunk", "portType": ["QSFP28", "SFP28"] },
-          "commands": ["load-interval 30"]
-        }
-      ]
-    },
-    "dc-edge": {
-      "name": "Datacenter Edge",
-      "description": "Trunk-heavy. No dot1x, no DTP negotiation on uplinks.",
-      "commands": {
-        "dot1x": [],
-        "access": ["switchport mode access"],
-        "trunk": ["switchport mode trunk", "switchport nonegotiate"],
         "portchannel": ["channel-group {cgNum} mode {cgMode}"],
         "shutdownTrue": ["shutdown"],
         "shutdownFalse": ["no shutdown"]

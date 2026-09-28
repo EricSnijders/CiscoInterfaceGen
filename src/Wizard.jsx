@@ -1,6 +1,7 @@
 import { useState, useMemo } from "react";
 import { SWITCH_MODELS, switchPorts, modulePorts, modulesFor, switchSummary, moduleSummary } from "./ref/hardware";
-import { RULESET_OPTIONS, rulesetSummary, rulesetUplinks, rulesetPortDefaults, rulesetNaming, formatDescription } from "./ref/rulesets";
+import { RULESET_OPTIONS, rulesetSummary, rulesetUplinks, rulesetPortDefaults, rulesetNaming,
+         rulesetManagement, rulesetDeviceToggles, formatDescription } from "./ref/rulesets";
 
 // Colors cycled per port group so the grid reads at a glance.
 const GROUP_COLORS = ["#3b82f6","#a3e635","#f97316","#a78bfa","#ec4899","#14b8a6","#facc15","#f87171"];
@@ -76,11 +77,12 @@ function interfaceList(ports) {
 }
 
 // ── YAML emitter — the whole point: indentation is never hand-typed ────────
-function buildYAML({ members, ruleset, mgmt, groups, portsById }) {
+function buildYAML({ members, ruleset, deviceFlags, mgmt, groups, portsById }) {
   const L = [];
   // Naming the ruleset in the file makes the config reproducible: whoever
   // regenerates it gets the same commands without picking anything.
   if (ruleset) L.push(`Ruleset: ${ruleset}`);
+  for (const [key, on] of Object.entries(deviceFlags || {})) if (on) L.push(`${key}: True`);
   L.push(`Devices:`);
   members.forEach((m, i) => L.push(`  ${i + 1}: ${m.model}`));
   const withModules = members.map((m, i) => [i + 1, m.module]).filter(([, mod]) => mod);
@@ -128,6 +130,7 @@ export default function Wizard({ onApply, rulesetId, onRulesetChange }) {
   const [members, setMembers]   = useState(() => [newMember()]);
   const [mgmt, setMgmt]         = useState({ ip: "", vlan: "", gw: "" });
   const [groups, setGroups]     = useState(() => [newGroup(1, rulesetPortDefaults(rulesetId))]);
+  const [deviceFlags, setDeviceFlags] = useState({});
   const [activeId, setActiveId] = useState(null);
   const [lastPort, setLastPort] = useState(null);
 
@@ -164,6 +167,9 @@ export default function Wizard({ onApply, rulesetId, onRulesetChange }) {
 
   const uplinkPolicy = rulesetUplinks(rulesetId);
   const naming = rulesetNaming(rulesetId);
+  const management = rulesetManagement(rulesetId);
+  const deviceToggles = rulesetDeviceToggles(rulesetId);
+  const onLoopback = String(management.interface || "vlan").toLowerCase() === "loopback";
   const proposedUplinks = useMemo(
     () => uplinkPorts(members, allPorts, uplinkPolicy),
     [members, allPorts, uplinkPolicy]
@@ -231,8 +237,8 @@ export default function Wizard({ onApply, rulesetId, onRulesetChange }) {
   const issues = [...new Set(problems)];
 
   const yaml = useMemo(
-    () => buildYAML({ members, ruleset: rulesetId, mgmt, groups: cleanGroups.map(g => ({ ...g, name: g.name.trim() })), portsById }),
-    [members, rulesetId, mgmt, cleanGroups, portsById]
+    () => buildYAML({ members, ruleset: rulesetId, deviceFlags, mgmt, groups: cleanGroups.map(g => ({ ...g, name: g.name.trim() })), portsById }),
+    [members, rulesetId, deviceFlags, mgmt, cleanGroups, portsById]
   );
   const assigned = cleanGroups.reduce((n, g) => n + g.ports.length, 0);
 
@@ -311,19 +317,41 @@ export default function Wizard({ onApply, rulesetId, onRulesetChange }) {
           </select>
           <div style={{ fontSize: 11, color: "#64748b", marginTop: 5 }}>{rulesetSummary(rulesetId)}</div>
         </div>
+
+        {/* Box-wide features the ruleset offers — global config, not per port. */}
+        {deviceToggles.length > 0 && (
+          <div style={{ marginTop: 14, borderTop: "1px solid #334155", paddingTop: 12 }}>
+            <label style={label}>Device features</label>
+            {deviceToggles.map(t => (
+              <div key={t.key} style={{ marginBottom: 6 }}>
+                <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", fontSize: 13, color: "#cbd5e1" }}>
+                  <input type="checkbox" checked={Boolean(deviceFlags[t.key])}
+                    onChange={e => setDeviceFlags(prev => ({ ...prev, [t.key]: e.target.checked }))} />
+                  {t.label || t.key}
+                </label>
+                {t.hint && <div style={{ fontSize: 11, color: "#64748b", marginLeft: 24 }}>{t.hint}</div>}
+              </div>
+            ))}
+          </div>
+        )}
       </div>
 
       {/* 2 ── Management */}
       <div style={card}>
         <div style={stepTitle}>
           <span style={badge}>2</span> Management
-          <span style={{ fontWeight: 400, color: "#64748b", fontSize: 12 }}>— optional</span>
+          <span style={{ fontWeight: 400, color: "#64748b", fontSize: 12 }}>
+            — optional · {onLoopback
+              ? `this ruleset addresses management on Loopback${management.number ?? 0}`
+              : "this ruleset addresses management on a VLAN interface"}
+          </span>
         </div>
         <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr 2fr", gap: 12 }}>
           <div><label style={label}>IP (CIDR)</label>
-            <input style={input} placeholder="192.168.1.10/24" value={mgmt.ip} onChange={e => setMgmt({ ...mgmt, ip: e.target.value })} /></div>
-          <div><label style={label}>VLAN</label>
-            <input style={input} placeholder="10" value={mgmt.vlan} onChange={e => setMgmt({ ...mgmt, vlan: e.target.value })} /></div>
+            <input style={input} placeholder={onLoopback ? "10.0.0.1/32" : "192.168.1.10/24"} value={mgmt.ip} onChange={e => setMgmt({ ...mgmt, ip: e.target.value })} /></div>
+          <div>
+            <label style={label}>VLAN {onLoopback && <span style={{ color: "#475569", fontWeight: 400 }}>(unused)</span>}</label>
+            <input style={input} disabled={onLoopback} placeholder="10" value={mgmt.vlan} onChange={e => setMgmt({ ...mgmt, vlan: e.target.value })} /></div>
           <div><label style={label}>Default gateway</label>
             <input style={input} placeholder="192.168.1.1" value={mgmt.gw} onChange={e => setMgmt({ ...mgmt, gw: e.target.value })} /></div>
         </div>
